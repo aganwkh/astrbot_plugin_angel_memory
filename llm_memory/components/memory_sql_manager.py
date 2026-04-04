@@ -1971,16 +1971,17 @@ class MemorySqlManager:
         scope_cond, scope_params = self._scope_sql(memory_scope, "mr")
         
         # 硬性时间范围查询，忽略 is_archived = 1 使得即使衰减的旧事也能按时间捞回
+        # llm_memory/components/memory_sql_manager.py 第 998 行为：
         sql = f"""
             SELECT id, memory_type, judgment, reasoning, strength,
                    is_active, useful_count, useful_score, last_recalled_at,
                    memory_scope, created_at
             FROM memory_records mr
-            WHERE is_archived = 0 
-              AND created_at >= ? AND created_at <= ?
+            WHERE created_at >= ? AND created_at <= ?
               AND {scope_cond}
             ORDER BY created_at DESC
         """
+# 注意：删除了原有的 is_archived = 0 条件
         with self._connect() as conn:
             rows = conn.execute(sql, (start_ts, end_ts, *scope_params)).fetchall()
             tags_map = self._fetch_tags_for_memory_ids(conn, [str(row["id"]) for row in rows])

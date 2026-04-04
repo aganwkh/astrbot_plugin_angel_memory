@@ -18,15 +18,17 @@ class CoreMemoryRememberTool(FunctionTool):
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
+            # tools/core_memory_remember.py 第 16-24 行
             "properties": {
                 "judgment": {
                     "type": "string",
-                    "description": "核心论断，50字符内，不换行。例：'用户对猫毛过敏'",
+                    "description": "核心论断。例：'用户对猫毛过敏'", # 删除了“50字符内，不换行”
                 },
                 "reasoning": {
                     "type": "string",
-                    "description": "论证或背景，50字符内，不换行。例：'用户明确提及过敏史'",
+                    "description": "论证或背景。必须完整保留得出该结论的上下文原话（允许换行）。", # 引导模型打包原话
                 },
+
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },

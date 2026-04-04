@@ -140,19 +140,7 @@ class AngelMemoryPlugin(Star):
             f"Angel Memory Plugin 实例创建完成 (提供商: {self.plugin_context.get_current_provider()}), 后台初始化已启动"
         )
         
-        def _init_raw_db(self):
-            import sqlite3
-            with sqlite3.connect(self.raw_db_path) as conn:
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS chat_window (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id TEXT,
-                        role TEXT,
-                        content TEXT,
-                        timestamp REAL
-                    )
-                ''')
-                conn.execute('CREATE INDEX IF NOT EXISTS idx_session ON chat_window(session_id)')
+        
                 
     def _init_raw_db(self):
         import sqlite3
@@ -243,16 +231,14 @@ class AngelMemoryPlugin(Star):
             # --- 第二批次新增：短时记忆冷启动单次注入 ---
             session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
             if session_id and session_id not in getattr(self, '_active_sessions', set()):
-                import sqlite3
-                with sqlite3.connect(self.raw_db_path) as conn:
-                    cursor = conn.cursor()
-                    # 提取最近 3 轮（6条）对话
-                    cursor.execute(
-                        "SELECT role, content FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT 6",
-                        (session_id,)
-                    )
-                    rows = cursor.fetchall()
+                def _fetch_history():
+                    import sqlite3
+                    with sqlite3.connect(self.raw_db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT role, content FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT 6", (session_id,))
+                        return cursor.fetchall()
                 
+                rows = await asyncio.to_thread(_fetch_history) # 异步调用
                 if rows:
                     rows.reverse()
                     history_text = "\n".join([f"{r[0]}: {r[1]}" for r in rows])
@@ -374,9 +360,9 @@ class AngelMemoryPlugin(Star):
         try:
             # --- 第二批次新增：物理级短时记忆留存（完全独立于大模型总结） ---
             session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+            # 修改 2：after_message_sent 中
             if session_id and hasattr(event, "angelmemory_context"):
                 import json
-                import sqlite3
                 import time
                 try:
                     context_data = json.loads(event.angelmemory_context)
@@ -384,19 +370,22 @@ class AngelMemoryPlugin(Star):
                     assistant_text = context_data.get("llm_response", {}).get("completion_text", "")
                     
                     if user_text and assistant_text:
-                        with sqlite3.connect(self.raw_db_path) as conn:
-                            cursor = conn.cursor()
-                            now = time.time()
-                            # 写入 User 和 Assistant 原话
-                            cursor.execute("INSERT INTO chat_window (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)", (session_id, "User", user_text, now))
-                            cursor.execute("INSERT INTO chat_window (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)", (session_id, "Assistant", assistant_text, now))
-                            # 滚动删除机制，安全控制单会话仅保留最近 50 条
-                            cursor.execute("""
-                                DELETE FROM chat_window 
-                                WHERE session_id = ? AND id NOT IN (
-                                    SELECT id FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT 50
-                                )
-                            """, (session_id, session_id))
+                        def _write_history():
+                            import sqlite3
+                            with sqlite3.connect(self.raw_db_path) as conn:
+                                cursor = conn.cursor()
+                                now = time.time()
+                                cursor.execute("INSERT INTO chat_window (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)", (session_id, "User", user_text, now))
+                                cursor.execute("INSERT INTO chat_window (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)", (session_id, "Assistant", assistant_text, now))
+                                cursor.execute("""
+                                    DELETE FROM chat_window 
+                                    WHERE session_id = ? AND id NOT IN (
+                                        SELECT id FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT 50
+                                    )
+                                """, (session_id, session_id))
+                                conn.commit()
+                        
+                        await asyncio.to_thread(_write_history) # 异步调用
                 except Exception as e:
                     self.logger.warning(f"短时记忆物理写入失败: {e}")
             # --- 结束新增 ---
