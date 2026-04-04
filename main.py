@@ -228,23 +228,29 @@ class AngelMemoryPlugin(Star):
         await self._log_event_persona(event)
         await self._log_group_id_once(event)
         try:
-            # --- 第二批次新增：短时记忆冷启动单次注入 ---
+            # --- 短时记忆冷启动单次注入 ---
             session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
             if session_id and session_id not in getattr(self, '_active_sessions', set()):
-                def _fetch_history():
-                    import sqlite3
-                    with sqlite3.connect(self.raw_db_path) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT role, content FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT 6", (session_id,))
-                        return cursor.fetchall()
-                
-                rows = await asyncio.to_thread(_fetch_history) # 异步调用
-                if rows:
-                    rows.reverse()
-                    history_text = "\n".join([f"{r[0]}: {r[1]}" for r in rows])
-                    injection = f"\n\n[系统提示：以下是系统重启前你与用户的最近几轮对话记录，用于恢复语境。]\n{history_text}\n[恢复完毕，请结合以上语境回复用户当前的问题。]"
-                    request.system_prompt += injection
-                    self.logger.info(f"已为会话 {session_id} 注入冷启动历史语境。")
+                # 动态获取配置，默认 6，限制最小 0，最大 50 (对齐物理窗口)
+                config = self.plugin_context.get_all_config() if self.plugin_context else {}
+                injection_limit = min(max(int(config.get("cold_start_history_limit", 6)), 0), 50)
+
+                if injection_limit > 0:
+                    def _fetch_history():
+                        import sqlite3
+                        with sqlite3.connect(self.raw_db_path) as conn:
+                            cursor = conn.cursor()
+                            # 动态传入 limit 参数
+                            cursor.execute("SELECT role, content FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT ?", (session_id, injection_limit))
+                            return cursor.fetchall()
+                    
+                    rows = await asyncio.to_thread(_fetch_history)
+                    if rows:
+                        rows.reverse()
+                        history_text = "\n".join([f"{r[0]}: {r[1]}" for r in rows])
+                        injection = f"\n\n[系统提示：以下是系统重启前你与用户的最近几轮对话记录，用于恢复语境。]\n{history_text}\n[恢复完毕，请结合以上语境回复用户当前的问题。]"
+                        request.system_prompt += injection
+                        self.logger.info(f"已为会话 {session_id} 注入冷启动历史语境，共计 {len(rows)} 条。")
                 
                 self._active_sessions.add(session_id)
             # --- 结束新增 ---
