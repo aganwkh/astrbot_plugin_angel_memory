@@ -846,7 +846,7 @@ class VectorStore:
         return recalled
 
     async def embed_documents(
-        self, documents: List[str], is_query: bool = False, timeout: int = 3
+        self, documents: List[str], is_query: bool = False, timeout: int = 20
     ) -> Optional[List[List[float]]]:
         """
         使用嵌入提供商为文档列表生成向量嵌入(异步方法).
@@ -964,7 +964,7 @@ class VectorStore:
             raise Exception("向量化失败:未知错误")
 
     async def embed_single_document(
-        self, document: str, is_query: bool = False, timeout: int = 3
+        self, document: str, is_query: bool = False, timeout: int = 20
     ) -> Optional[List[float]]:
         """
         为单个文档生成向量嵌入(异步方法).
@@ -986,7 +986,7 @@ class VectorStore:
             return embeddings[0]
         return None
 
-    async def embed_text_direct(self, text: str, is_query: bool = False, timeout: int = 3) -> Optional[List[float]]:
+    async def embed_text_direct(self, text: str, is_query: bool = False, timeout: int = 20) -> Optional[List[float]]:
         """
         直接向量化文本，不经过复杂处理和缓存
 

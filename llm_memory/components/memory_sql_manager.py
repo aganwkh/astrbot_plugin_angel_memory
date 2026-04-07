@@ -1943,28 +1943,98 @@ class MemorySqlManager:
 
     def _recall_by_time_sync(self, time_range: str, memory_scope: str) -> List[BaseMemory]:
         import time
+        # 基础时间获取
         from datetime import datetime, timedelta
-        
         now = datetime.now()
         start_ts = 0.0
-        end_ts = time.time()
+        end_ts = now.timestamp()
         
-        # 将自然语言标记解析为具体时间戳范围
-        if time_range == "today_morning":
-            start = now.replace(hour=0, minute=0, second=0)
-            end = now.replace(hour=12, minute=0, second=0)
-            start_ts, end_ts = start.timestamp(), end.timestamp()
+        # 提取昨日的基准时间以复用
+        yesterday_base = now - timedelta(days=1)
+
+        if time_range == "just_now":
+            start_ts = (now - timedelta(hours=2)).timestamp()
+            
+        elif time_range == "early_morning":
+            start_ts = now.replace(hour=0, minute=0, second=0).timestamp()
+            end_ts = now.replace(hour=5, minute=59, second=59).timestamp()
+            
+        elif time_range == "today_morning":
+            start_ts = now.replace(hour=6, minute=0, second=0).timestamp()
+            end_ts = now.replace(hour=11, minute=30, second=0).timestamp()
+            
+        elif time_range == "noon":
+            start_ts = now.replace(hour=11, minute=30, second=0).timestamp()
+            end_ts = now.replace(hour=13, minute=30, second=0).timestamp()
+            
         elif time_range == "today_afternoon":
-            start = now.replace(hour=12, minute=0, second=0)
-            end = now.replace(hour=23, minute=59, second=59)
-            start_ts, end_ts = start.timestamp(), end.timestamp()
+            start_ts = now.replace(hour=13, minute=30, second=0).timestamp()
+            end_ts = now.replace(hour=18, minute=0, second=0).timestamp()
+            
+        elif time_range == "today_night":
+            start_ts = now.replace(hour=18, minute=0, second=0).timestamp()
+            end_ts = now.replace(hour=23, minute=59, second=59).timestamp()
+
+        # --- 昨天精确时段补充 ---
+        elif time_range == "yesterday_early_morning":
+            start_ts = yesterday_base.replace(hour=0, minute=0, second=0).timestamp()
+            end_ts = yesterday_base.replace(hour=5, minute=59, second=59).timestamp()
+            
+        elif time_range == "yesterday_morning":
+            start_ts = yesterday_base.replace(hour=6, minute=0, second=0).timestamp()
+            end_ts = yesterday_base.replace(hour=11, minute=30, second=0).timestamp()
+            
+        elif time_range == "yesterday_noon":
+            start_ts = yesterday_base.replace(hour=11, minute=30, second=0).timestamp()
+            end_ts = yesterday_base.replace(hour=13, minute=30, second=0).timestamp()
+            
+        elif time_range == "yesterday_afternoon":
+            start_ts = yesterday_base.replace(hour=13, minute=30, second=0).timestamp()
+            end_ts = yesterday_base.replace(hour=18, minute=0, second=0).timestamp()
+            
+        elif time_range == "last_night":
+            start_ts = yesterday_base.replace(hour=18, minute=0, second=0).timestamp()
+            end_ts = yesterday_base.replace(hour=23, minute=59, second=59).timestamp()
+            
         elif time_range == "yesterday":
-            start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0)
-            end = (now - timedelta(days=1)).replace(hour=23, minute=59, second=59)
-            start_ts, end_ts = start.timestamp(), end.timestamp()
+            start_ts = yesterday_base.replace(hour=0, minute=0, second=0).timestamp()
+            end_ts = yesterday_base.replace(hour=23, minute=59, second=59).timestamp()
+
+        # --- 中短期 ---
+        elif time_range == "a_few_days_ago":
+            start_ts = (now - timedelta(days=3)).timestamp()
+            
+        elif time_range == "this_week":
+            # 找到本周一 00:00
+            monday = now - timedelta(days=now.weekday())
+            start_ts = monday.replace(hour=0, minute=0, second=0).timestamp()
+            
         elif time_range == "past_7_days":
-            start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0)
-            start_ts = start.timestamp()
+            start_ts = (now - timedelta(days=7)).timestamp()
+            
+        elif time_range == "last_weekend":
+            # 上周五 18:00 到 上周日 23:59
+            last_friday = now - timedelta(days=now.weekday() + 3)
+            last_sunday = now - timedelta(days=now.weekday() + 1)
+            start_ts = last_friday.replace(hour=18, minute=0, second=0).timestamp()
+            end_ts = last_sunday.replace(hour=23, minute=59, second=59).timestamp()
+
+        # --- 中长期 ---
+        elif time_range == "this_month":
+            start_ts = now.replace(day=1, hour=0, minute=0, second=0).timestamp()
+            
+        elif time_range == "past_30_days":
+            start_ts = (now - timedelta(days=30)).timestamp()
+            
+        elif time_range == "past_3_months":
+            start_ts = (now - timedelta(days=90)).timestamp()
+            
+        elif time_range == "this_year":
+            start_ts = now.replace(month=1, day=1, hour=0, minute=0, second=0).timestamp()
+            
+        elif time_range == "past_year":
+            start_ts = (now - timedelta(days=365)).timestamp()
+            
         else:
             return []
 

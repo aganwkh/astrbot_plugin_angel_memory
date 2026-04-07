@@ -52,7 +52,7 @@ def configure_logging_behavior():
     "astrbot_plugin_angel_memory",
     "kawayiYokami",
     "天使的记忆，让astrbot拥有记忆维护系统和开箱即用的知识库检索",
-    "1.2.8",
+    "1.3.10",
     "https://github.com/kawayiYokami/astrbot_plugin_angel_memory"
 )
 class AngelMemoryPlugin(Star):
@@ -126,12 +126,10 @@ class AngelMemoryPlugin(Star):
             self.llm_tools_enabled = False
             self.logger.error(f"❌ 注册LLM工具时发生异常: {e}", exc_info=True)
             self.logger.warning("⚠️ LLM工具功能已禁用，插件将继续以基础模式运行")
-            # --- 第二批次新增：初始化短时记忆滑动窗口数据库与状态机 ---
-        import sqlite3
+            # --- 第二批次新增：初始化短时记忆滑动窗口数据库 ---
         from pathlib import Path
         self.raw_db_path = Path(data_dir) / "raw_chat_window.db"
         self._init_raw_db()
-        self._active_sessions = set()  # 记录已激活冷启动的会话，用于实现“只注入一次”
         # --- 结束新增 ---
         self.logger.info(
             f"天使记忆数据路径设置为: {self.plugin_context.get_index_dir().resolve()}"
@@ -155,6 +153,73 @@ class AngelMemoryPlugin(Star):
                 )
             ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_session ON chat_window(session_id)')
+
+    def _fetch_recent_raw_chat_records(
+        self, session_id: str, limit: int = 15
+    ) -> list[tuple[str, str]]:
+        import sqlite3
+
+        with sqlite3.connect(self.raw_db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT role, content
+                FROM chat_window
+                WHERE session_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+            rows = cursor.fetchall()
+
+        rows.reverse()
+        return rows
+
+    def _build_raw_chat_anchor(self, rows: list[tuple[str, str]]) -> str:
+        history_text = "\n".join(
+            f"{str(role or '').strip()}: {str(content or '').strip()}"
+            for role, content in rows
+        )
+        return (
+            "\n\n【🔴 绝对时序锚点：以下是用户近期的真实物理对话记录，不受任何框架截断影响。"
+            "优先级最高！如果用户询问'刚才'、'前面'的内容，或验证其原话，必须且只能以此记录为准！】\n"
+            f"{history_text}\n"
+            "【锚点结束，回到当前对话状态。】"
+        )
+
+    async def _inject_recent_raw_chat_anchor(
+        self, event: AstrMessageEvent, request: ProviderRequest
+    ) -> None:
+        session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not session_id:
+            self.logger.debug("[短时记忆锚点] 跳过 原因=缺少有效session_id")
+            return
+
+        try:
+            rows = await asyncio.to_thread(
+                self._fetch_recent_raw_chat_records, session_id, 15
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[短时记忆锚点] 失败 session={session_id} error={e}",
+                exc_info=True,
+            )
+            return
+
+        if not rows:
+            self.logger.debug(
+                f"[短时记忆锚点] 跳过 session={session_id} 原因=无物理对话记录"
+            )
+            return
+
+        request.system_prompt = (
+            f"{str(getattr(request, 'system_prompt', '') or '')}"
+            f"{self._build_raw_chat_anchor(rows)}"
+        )
+        self.logger.info(
+            f"[短时记忆锚点] 完成 session={session_id} 注入条数={len(rows)}"
+        )
 
     def _load_complete_config(self):
         """在主线程检查配置项"""
@@ -228,32 +293,7 @@ class AngelMemoryPlugin(Star):
         await self._log_event_persona(event)
         await self._log_group_id_once(event)
         try:
-            # --- 短时记忆冷启动单次注入 ---
-            session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
-            if session_id and session_id not in getattr(self, '_active_sessions', set()):
-                # 动态获取配置，默认 6，限制最小 0，最大 50 (对齐物理窗口)
-                config = self.plugin_context.get_all_config() if self.plugin_context else {}
-                injection_limit = min(max(int(config.get("cold_start_history_limit", 6)), 0), 50)
-
-                if injection_limit > 0:
-                    def _fetch_history():
-                        import sqlite3
-                        with sqlite3.connect(self.raw_db_path) as conn:
-                            cursor = conn.cursor()
-                            # 动态传入 limit 参数
-                            cursor.execute("SELECT role, content FROM chat_window WHERE session_id = ? ORDER BY id DESC LIMIT ?", (session_id, injection_limit))
-                            return cursor.fetchall()
-                    
-                    rows = await asyncio.to_thread(_fetch_history)
-                    if rows:
-                        rows.reverse()
-                        history_text = "\n".join([f"{r[0]}: {r[1]}" for r in rows])
-                        injection = f"\n\n[系统提示：以下是系统重启前你与用户的最近几轮对话记录，用于恢复语境。]\n{history_text}\n[恢复完毕，请结合以上语境回复用户当前的问题。]"
-                        request.system_prompt += injection
-                        self.logger.info(f"已为会话 {session_id} 注入冷启动历史语境，共计 {len(rows)} 条。")
-                
-                self._active_sessions.add(session_id)
-            # --- 结束新增 ---
+            await self._inject_recent_raw_chat_anchor(event, request)
 
             # 检查LLM工具是否可用
             if not self.are_llm_tools_enabled():

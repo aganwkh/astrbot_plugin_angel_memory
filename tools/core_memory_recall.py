@@ -19,7 +19,13 @@ except ImportError:
 @dataclass
 class CoreMemoryRecallTool(FunctionTool):
     name: str = "core_memory_recall"
-    description: str = "当你需要主动反思或回顾那些已被你'铭记'的核心原则、长期目标或关键事实时，调用此工具。你必须提供明确的检索 query（不能为 None 或空字符串），系统会先按 query 检索，再根据记忆强度进行**加权随机抽取**。"
+    description: str = (
+        "当你需要主动反思或回顾那些已被你'铭记'的核心原则、长期目标或关键事实时，调用此工具。"
+        "你必须提供明确的检索 query（不能为 None 或空字符串），系统会先按 query 检索，再根据记忆强度进行**加权随机抽取**。"
+        "【强制指令】：当用户明确提问“以前聊了什么”、“我原话是什么”、“你还记得……吗”，"
+        "或质疑你的记忆断层、要求核对刚才/前面/昨晚等历史对话内容时，你必须立即调用此工具！"
+        "严禁凭空推断或直接回复“没有记录”。"
+    )
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -36,8 +42,14 @@ class CoreMemoryRecallTool(FunctionTool):
                 },
                 "time_range": {
                     "type": "string",
-                    "description": "可选。当用户明确提及时间范围（如'上午'、'昨天'、'上周'）时，输出标准化格式，例如 'today_morning', 'today_afternoon', 'yesterday', 'past_7_days'。如果不明确则留空。",
-                    "enum": ["", "today_morning", "today_afternoon", "yesterday", "past_7_days"]
+                    "description": "可选。当用户明确提及时间范围时（如：刚才、凌晨、上午、昨天中午、这周、上周末、这个月等），输出对应的标准化格式。如果不明确则留空。",
+                    "enum": [
+                        "",
+                        "just_now", "early_morning", "today_morning", "noon", "today_afternoon", "today_night",
+                        "yesterday_early_morning", "yesterday_morning", "yesterday_noon", "yesterday_afternoon", "last_night",
+                        "yesterday", "a_few_days_ago", "this_week", "past_7_days", "last_weekend",
+                        "this_month", "past_30_days", "past_3_months", "this_year", "past_year"
+                    ]
                 }
             },
             "required": ["limit", "query"]
@@ -80,7 +92,13 @@ class CoreMemoryRecallTool(FunctionTool):
         # --- 调用服务 ---
         try:
             # --- 第三批次新增：优先拦截时间维度检索 ---
-            if time_range and time_range in ["today_morning", "today_afternoon", "yesterday", "past_7_days"]:
+            valid_time_ranges = [
+                "just_now", "early_morning", "today_morning", "noon", "today_afternoon", "today_night",
+                "yesterday_early_morning", "yesterday_morning", "yesterday_noon", "yesterday_afternoon", "last_night",
+                "yesterday", "a_few_days_ago", "this_week", "past_7_days", "last_weekend",
+                "this_month", "past_30_days", "past_3_months", "this_year", "past_year"
+            ]
+            if time_range and time_range in valid_time_ranges:
                 sql_manager = getattr(memory_runtime, "sql_manager", None)
                 if sql_manager and hasattr(sql_manager, "recall_by_time"):
                     self.logger.info(f"{self.name}: 触发时间维度硬性检索 -> {time_range}")
