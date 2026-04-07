@@ -13,6 +13,48 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 
+RECALL_TRIGGER_PHRASES = [
+    "聊了什么",
+    "聊过什么",
+    "聊的什么",
+    "聊了啥",
+    "聊过啥",
+    "说了什么",
+    "说过什么",
+    "说的什么",
+    "说了啥",
+    "说过啥",
+    "原话是什么",
+    "原话",
+    "原句",
+    "提过",
+    "提到过",
+    "聊过",
+    "还记得",
+    "是不是聊过",
+    "是不是提过",
+    "有没有聊过",
+    "有没有提过",
+]
+
+RAW_CHAT_PRIORITY_PHRASES = [
+    "原话",
+    "原句",
+    "说了什么",
+    "说过什么",
+    "说的什么",
+    "说了啥",
+    "聊了什么",
+    "聊过什么",
+    "聊的什么",
+    "聊了啥",
+    "提过",
+    "刚才",
+    "刚刚",
+    "前面",
+    "前文",
+]
+
 
 @dataclass
 class TimeIntentDiagnostic:
@@ -26,12 +68,22 @@ class TimeIntentDiagnostic:
     note: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        start_ts = 0.0
+        end_ts = 0.0
+        start_dt = _parse_datetime(self.start_time, self.timezone)
+        end_dt = _parse_datetime(self.end_time, self.timezone)
+        if start_dt is not None:
+            start_ts = float(start_dt.timestamp())
+        if end_dt is not None:
+            end_ts = float(end_dt.timestamp())
         return {
             "matched": bool(self.matched),
             "intent_type": str(self.intent_type or ""),
             "normalized_time_range": str(self.normalized_time_range or ""),
             "start_time": str(self.start_time or ""),
             "end_time": str(self.end_time or ""),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
             "timezone": str(self.timezone or DEFAULT_TIMEZONE),
             "matched_phrases": list(self.matched_phrases or []),
             "note": str(self.note or ""),
@@ -49,6 +101,23 @@ def _get_now(timezone_name: str = DEFAULT_TIMEZONE) -> datetime:
 
 def _format_datetime(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_datetime(value: str, timezone_name: str = DEFAULT_TIMEZONE) -> datetime | None:
+    safe_value = str(value or "").strip()
+    if not safe_value:
+        return None
+    try:
+        parsed = datetime.strptime(safe_value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+    if ZoneInfo is not None:
+        try:
+            return parsed.replace(tzinfo=ZoneInfo(timezone_name))
+        except Exception:
+            return parsed
+    return parsed
 
 
 def _match_phrases(text: str, phrases: Sequence[str]) -> List[str]:
@@ -99,11 +168,11 @@ def analyze_time_intent(
         },
         {
             "intent_type": "前面",
-            "normalized_time_range": "",
+            "normalized_time_range": "recent_context",
             "phrases": ["前面", "前文", "前一段", "刚刚前面"],
-            "start": None,
-            "end": None,
-            "note": "当前代码库没有为“前面”定义统一时间窗口，只能视作上下文回指。",
+            "start": now - timedelta(hours=6),
+            "end": now,
+            "note": "默认映射为当前会话近 6 小时窗口，并优先参考 raw_chat_window。",
         },
         {
             "intent_type": "上次",
@@ -149,6 +218,56 @@ def compare_time_intent(before_text: str, after_text: str) -> Dict[str, Any]:
         "after_normalized_time_range": after.normalized_time_range,
         "after_matched_phrases": after.matched_phrases,
         "lost": bool(before.matched and not after.matched),
+    }
+
+
+def build_time_filter_payload(
+    text_or_intent: str | TimeIntentDiagnostic,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> Dict[str, Any]:
+    intent = (
+        text_or_intent
+        if isinstance(text_or_intent, TimeIntentDiagnostic)
+        else analyze_time_intent(str(text_or_intent or ""), timezone_name=timezone_name)
+    )
+    start_dt = _parse_datetime(intent.start_time, intent.timezone or timezone_name)
+    end_dt = _parse_datetime(intent.end_time, intent.timezone or timezone_name)
+    start_ts = float(start_dt.timestamp()) if start_dt is not None else 0.0
+    end_ts = float(end_dt.timestamp()) if end_dt is not None else 0.0
+    has_explicit_window = bool(start_ts > 0 and end_ts > 0 and end_ts >= start_ts)
+    return {
+        "matched": bool(intent.matched and has_explicit_window),
+        "intent_type": str(intent.intent_type or ""),
+        "normalized_time_range": str(intent.normalized_time_range or ""),
+        "start_time": str(intent.start_time or ""),
+        "end_time": str(intent.end_time or ""),
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "timezone": str(intent.timezone or timezone_name or DEFAULT_TIMEZONE),
+        "matched_phrases": list(intent.matched_phrases or []),
+        "note": str(intent.note or ""),
+        "has_explicit_window": has_explicit_window,
+    }
+
+
+def analyze_recall_request(text: str) -> Dict[str, Any]:
+    safe_text = str(text or "").strip()
+    if not safe_text:
+        return {
+            "matched": False,
+            "matched_phrases": [],
+            "raw_chat_priority": False,
+            "recent_fact_priority": False,
+        }
+
+    matched_phrases = _match_phrases(safe_text, RECALL_TRIGGER_PHRASES)
+    raw_chat_hits = _match_phrases(safe_text, RAW_CHAT_PRIORITY_PHRASES)
+    matched = bool(matched_phrases or raw_chat_hits)
+    return {
+        "matched": matched,
+        "matched_phrases": list(dict.fromkeys(matched_phrases + raw_chat_hits)),
+        "raw_chat_priority": bool(raw_chat_hits),
+        "recent_fact_priority": matched,
     }
 
 

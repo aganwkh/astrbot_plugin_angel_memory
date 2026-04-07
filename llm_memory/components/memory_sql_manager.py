@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -560,6 +561,135 @@ class MemorySqlManager:
         return scope in {target, "public"}
 
     @staticmethod
+    def _normalize_time_filter(time_filter: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(time_filter, dict):
+            return {}
+        try:
+            start_ts = float(time_filter.get("start_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            start_ts = 0.0
+        try:
+            end_ts = float(time_filter.get("end_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            end_ts = 0.0
+        matched = bool(time_filter.get("matched")) and start_ts > 0 and end_ts >= start_ts
+        if not matched:
+            return {}
+        normalized = dict(time_filter)
+        normalized["matched"] = True
+        normalized["start_ts"] = start_ts
+        normalized["end_ts"] = end_ts
+        return normalized
+
+    def _get_memories_in_time_window_sync(
+        self,
+        memory_scope: str,
+        time_filter: Dict[str, Any],
+        limit: int,
+    ) -> List[BaseMemory]:
+        normalized_time_filter = self._normalize_time_filter(time_filter)
+        if not normalized_time_filter:
+            return []
+        scope_cond, scope_params = self._scope_sql(memory_scope, "mr")
+        sql = f"""
+            SELECT id, memory_type, judgment, reasoning, strength,
+                   is_active, useful_count, useful_score, last_recalled_at,
+                   memory_scope, created_at
+            FROM memory_records mr
+            WHERE {scope_cond}
+              AND mr.created_at >= ?
+              AND mr.created_at <= ?
+            ORDER BY mr.created_at DESC
+            LIMIT ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                sql,
+                (
+                    *scope_params,
+                    float(normalized_time_filter["start_ts"]),
+                    float(normalized_time_filter["end_ts"]),
+                    max(1, int(limit)),
+                ),
+            ).fetchall()
+            tags_map = self._fetch_tags_for_memory_ids(
+                conn,
+                [str(row["id"]) for row in rows],
+            )
+        return [self._row_to_memory(row, tags_map.get(str(row["id"]), [])) for row in rows]
+
+    @staticmethod
+    def _extract_search_terms(query: str) -> List[str]:
+        normalized = str(query or "").lower().strip()
+        if not normalized:
+            return []
+        for phrase in [
+            "昨晚",
+            "昨天晚上",
+            "昨天",
+            "刚才",
+            "刚刚",
+            "前面",
+            "前文",
+            "聊了什么",
+            "聊过什么",
+            "说了什么",
+            "说过什么",
+            "原话是什么",
+            "原话",
+            "原句",
+            "是不是",
+            "有没有",
+            "我们",
+            "我",
+            "来着",
+        ]:
+            normalized = normalized.replace(phrase, " ")
+        tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", normalized)
+        seen = set()
+        result: List[str] = []
+        for token in tokens:
+            safe = str(token or "").strip()
+            if not safe:
+                continue
+            if safe in {"什么", "那个", "这个", "一下", "一下子", "是不是", "有没有"}:
+                continue
+            if len(safe) == 1 and not safe.isalnum():
+                continue
+            if safe in seen:
+                continue
+            seen.add(safe)
+            result.append(safe)
+        return result[:12]
+
+    @staticmethod
+    def _text_overlap_score(query_terms: List[str], doc_text: str) -> float:
+        if not query_terms:
+            return 0.0
+        normalized_doc = str(doc_text or "").lower()
+        hits = sum(1 for term in query_terms if term and term in normalized_doc)
+        if hits <= 0:
+            return 0.0
+        return float(hits) / float(len(query_terms))
+
+    @staticmethod
+    def _recency_score(memory: BaseMemory, time_filter: Optional[Dict[str, Any]]) -> float:
+        normalized_time_filter = MemorySqlManager._normalize_time_filter(time_filter)
+        if not normalized_time_filter:
+            return 0.0
+        start_ts = float(normalized_time_filter["start_ts"])
+        end_ts = float(normalized_time_filter["end_ts"])
+        if end_ts <= start_ts:
+            return 0.0
+        try:
+            created_at = float(getattr(memory, "created_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        if created_at <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (created_at - start_ts) / (end_ts - start_ts)))
+
+    @staticmethod
     def _row_to_memory(row: sqlite3.Row, tags: List[str]) -> BaseMemory:
         keys = set(row.keys()) if hasattr(row, "keys") else set()
 
@@ -906,6 +1036,105 @@ class MemorySqlManager:
                 f"{getattr(mem, 'judgment', '')}\n{getattr(mem, 'reasoning', '')}\n{tags}"
             ).strip()
         return doc_text_map
+
+    async def _rank_time_window_memories(
+        self,
+        query: str,
+        candidate_memories: List[BaseMemory],
+        limit: int,
+        vector_scores: Optional[Dict[str, float]] = None,
+        time_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[BaseMemory]:
+        if not candidate_memories:
+            return []
+
+        ordered_ids = [str(mem.id) for mem in candidate_memories if str(mem.id or "").strip()]
+        doc_text_map = self._build_memory_doc_text_map_by_ids(ordered_ids)
+        query_terms = self._extract_search_terms(query)
+        rerank_map: Dict[str, float] = {}
+        created_at_map = {
+            str(getattr(memory, "id", "") or "").strip(): float(getattr(memory, "created_at", 0.0) or 0.0)
+            for memory in candidate_memories
+            if str(getattr(memory, "id", "") or "").strip()
+        }
+
+        base_scores: Dict[str, float] = {}
+        for memory in candidate_memories:
+            memory_id = str(getattr(memory, "id", "") or "").strip()
+            if not memory_id:
+                continue
+            doc_text = doc_text_map.get(memory_id, "")
+            lexical_score = self._text_overlap_score(query_terms, doc_text)
+            vector_score = float((vector_scores or {}).get(memory_id, 0.0) or 0.0)
+            recency_score = self._recency_score(memory, time_filter)
+            if query_terms:
+                base_scores[memory_id] = max(
+                    (0.45 * vector_score) + (0.35 * lexical_score) + (0.20 * recency_score),
+                    lexical_score,
+                    vector_score,
+                )
+            else:
+                base_scores[memory_id] = max((0.80 * recency_score) + (0.20 * vector_score), recency_score)
+
+        ordered_ids.sort(
+            key=lambda memory_id: (
+                float(base_scores.get(memory_id, 0.0)),
+                float(created_at_map.get(memory_id, 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+
+        if self._hybrid_engine.has_rerank() and query.strip() and len(ordered_ids) > 1:
+            reranked = await self._hybrid_engine.rerank_candidates(
+                query=query,
+                ordered_ids=ordered_ids,
+                doc_text_map=doc_text_map,
+            )
+            rerank_map = {
+                str(item.get("id") or "").strip(): float(item.get("final_score", 0.0) or 0.0)
+                for item in reranked
+                if str(item.get("id") or "").strip()
+            }
+
+        ranked: List[BaseMemory] = []
+        for memory in candidate_memories:
+            memory_id = str(getattr(memory, "id", "") or "").strip()
+            if not memory_id:
+                continue
+            doc_text = doc_text_map.get(memory_id, "")
+            lexical_score = self._text_overlap_score(query_terms, doc_text)
+            vector_score = float((vector_scores or {}).get(memory_id, 0.0) or 0.0)
+            recency_score = self._recency_score(memory, time_filter)
+            rerank_score = float(rerank_map.get(memory_id, 0.0) or 0.0)
+
+            if query_terms and rerank_score <= 0 and lexical_score <= 0 and vector_score < 0.45:
+                continue
+
+            if rerank_map:
+                final_score = max(
+                    (0.55 * rerank_score) + (0.25 * max(vector_score, lexical_score)) + (0.20 * recency_score),
+                    rerank_score,
+                )
+            elif query_terms:
+                final_score = max(
+                    (0.45 * vector_score) + (0.35 * lexical_score) + (0.20 * recency_score),
+                    lexical_score,
+                    vector_score,
+                )
+            else:
+                final_score = max((0.80 * recency_score) + (0.20 * vector_score), recency_score)
+
+            memory.similarity = float(final_score)
+            ranked.append(memory)
+
+        ranked.sort(
+            key=lambda mem: (
+                float(getattr(mem, "similarity", 0.0) or 0.0),
+                float(getattr(mem, "created_at", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return ranked[: max(1, int(limit))]
 
     async def search_note_index_by_tags(
         self,
@@ -1582,10 +1811,13 @@ class MemorySqlManager:
         limit: int,
         memory_scope: str,
         vector_scores: Optional[Dict[str, float]] = None,
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         text = str(query or "").strip()
         if not text:
             return []
+
+        normalized_time_filter = self._normalize_time_filter(time_filter)
 
         self.logger.info(
             "[时间过滤诊断][SimpleMemory检索入参] payload="
@@ -1595,10 +1827,51 @@ class MemorySqlManager:
                 'memory_scope': str(memory_scope or ''),
                 'has_vector_scores': bool(vector_scores),
                 'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
-                'time_filter_supported': False,
-                'time_filter_note': 'recall_by_tags 未接收时间窗口参数，仅做 scope 和分数过滤。'
+                'time_filter_supported': True,
+                'time_filter': normalized_time_filter,
+                'time_filter_note': '命中时间窗时，先在 SQL 中硬过滤 created_at，再在窗口内排序。'
             }, ensure_ascii=False)}"
         )
+
+        if normalized_time_filter:
+            window_limit = max(200, int(limit) * 40)
+            candidate_memories = await asyncio.to_thread(
+                self._get_memories_in_time_window_sync,
+                memory_scope,
+                normalized_time_filter,
+                window_limit,
+            )
+            if not candidate_memories:
+                self.logger.info(
+                    "[时间过滤诊断][SimpleMemory检索结果] payload="
+                    f"{json.dumps({
+                        'hit_count': 0,
+                        'time_filter_applied': True,
+                        'window_candidate_count': 0,
+                        'result_summary': summarize_memory_records([]),
+                    }, ensure_ascii=False)}"
+                )
+                return []
+
+            ordered = await self._rank_time_window_memories(
+                query=text,
+                candidate_memories=candidate_memories,
+                limit=limit,
+                vector_scores=vector_scores,
+                time_filter=normalized_time_filter,
+            )
+            self.logger.info(
+                "[时间过滤诊断][SimpleMemory检索结果] payload="
+                f"{json.dumps({
+                    'hit_count': len(candidate_memories),
+                    'ordered_count': len(ordered),
+                    'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+                    'time_filter_applied': True,
+                    'window_candidate_count': len(candidate_memories),
+                    'result_summary': summarize_memory_records(ordered),
+                }, ensure_ascii=False)}"
+            )
+            return ordered
 
         self._ensure_fts_ready_sync()
         candidate_limit = max(20, int(limit) * 20)
@@ -1625,8 +1898,8 @@ class MemorySqlManager:
             self.logger.info(
                 "[时间过滤诊断][SimpleMemory检索结果] payload="
                 f"{json.dumps({
-                    'hit_count': 0,
-                    'time_filter_supported': False,
+                'hit_count': 0,
+                    'time_filter_applied': False,
                     'result_summary': summarize_memory_records([]),
                 }, ensure_ascii=False)}"
             )
@@ -1665,6 +1938,7 @@ class MemorySqlManager:
                 'hit_count': len(hits),
                 'ordered_count': len(ordered),
                 'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+                'time_filter_applied': False,
                 'result_summary': summarize_memory_records(ordered),
             }, ensure_ascii=False)}"
         )

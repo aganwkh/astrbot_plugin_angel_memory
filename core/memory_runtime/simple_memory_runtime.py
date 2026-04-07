@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ...llm_memory.components.memory_sql_manager import MemorySqlManager
 from ...llm_memory.models.data_models import BaseMemory
@@ -11,6 +11,10 @@ class SimpleMemoryRuntime:
 
     def __init__(self, memory_sql_manager: MemorySqlManager):
         self._manager = memory_sql_manager
+
+    @property
+    def sql_manager(self) -> MemorySqlManager:
+        return self._manager
 
     async def remember(
         self,
@@ -64,12 +68,14 @@ class SimpleMemoryRuntime:
         event: Any = None,
         vector: Optional[List[float]] = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         limit = int(fresh_limit or 10)
         return await self._manager.recall_by_tags(
             query=query,
             limit=limit,
             memory_scope=memory_scope,
+            time_filter=time_filter,
         )
 
     async def chained_recall(
@@ -81,6 +87,7 @@ class SimpleMemoryRuntime:
         vector: Optional[List[float]] = None,
         event: Any = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         merged_query = " ".join([str(query or "").strip(), *[str(e).strip() for e in (entities or []) if str(e).strip()]]).strip()
         limit = int(final_limit or per_type_limit or 7)
@@ -88,6 +95,7 @@ class SimpleMemoryRuntime:
             query=merged_query,
             limit=limit,
             memory_scope=memory_scope,
+            time_filter=time_filter,
         )
         return memories
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ...llm_memory.models.data_models import BaseMemory
 from ...llm_memory.service.cognitive_service import CognitiveService
@@ -11,6 +11,10 @@ class VectorMemoryRuntime:
 
     def __init__(self, cognitive_service: CognitiveService):
         self._cognitive_service = cognitive_service
+
+    @property
+    def sql_manager(self):
+        return getattr(self._cognitive_service.memory_manager, "memory_sql_manager", None)
 
     async def remember(
         self,
@@ -55,6 +59,7 @@ class VectorMemoryRuntime:
         event: Any = None,
         vector: Optional[List[float]] = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         return await self._cognitive_service.comprehensive_recall(
             query=query,
@@ -62,6 +67,7 @@ class VectorMemoryRuntime:
             event=event,
             vector=vector,
             memory_scope=memory_scope,
+            time_filter=time_filter,
         )
 
     async def chained_recall(
@@ -73,6 +79,7 @@ class VectorMemoryRuntime:
         vector: Optional[List[float]] = None,
         event: Any = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         return await self._cognitive_service.chained_recall(
             query=query,
@@ -82,6 +89,7 @@ class VectorMemoryRuntime:
             vector=vector,
             event=event,
             memory_scope=memory_scope,
+            time_filter=time_filter,
         )
 
     async def feedback(

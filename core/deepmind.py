@@ -18,11 +18,15 @@ from astrbot.api.provider import ProviderRequest
 from .soul.soul_state import SoulState
 from .utils.memory_id_resolver import MemoryIDResolver
 from .utils.time_diagnostics import (
+    analyze_recall_request,
     analyze_time_intent,
+    build_time_filter_payload,
     compare_time_intent,
     get_event_diagnostic_store,
     preview_text,
+    summarize_memory_records,
     summarize_note_records,
+    summarize_raw_chat_rows,
     summarize_session_memories,
 )
 from ..llm_memory.utils.json_parser import JsonParser
@@ -245,7 +249,11 @@ class DeepMind:
         return self.retrieval_service.parse_memory_context(event)
 
     async def _retrieve_memories_and_notes(
-        self, event: AstrMessageEvent, query: str, precompute_vectors: bool = False
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        precompute_vectors: bool = False,
+        recall_policy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         检索长期记忆和候选笔记
@@ -259,7 +267,7 @@ class DeepMind:
             包含 long_term_memories, candidate_notes, note_id_mapping, secretary_decision 的字典
         """
         return await self.retrieval_service.retrieve_memories_and_notes(
-            event, query, precompute_vectors
+            event, query, precompute_vectors, recall_policy=recall_policy
         )
 
 
@@ -279,6 +287,8 @@ class DeepMind:
         note_context: str,
         soul_state_values: Optional[Dict[str, Any]] = None,
         has_secretary_decision: bool = False,
+        session_memories_override: Optional[List[Any]] = None,
+        extra_instruction: str = "",
     ) -> None:
         """
         将记忆、笔记和灵魂状态统一注入到LLM请求中（使用 extra_user_content_parts）
@@ -289,6 +299,8 @@ class DeepMind:
             note_context,
             soul_state_values,
             has_secretary_decision,
+            session_memories_override=session_memories_override,
+            extra_instruction=extra_instruction,
         )
 
     async def _update_memory_system(
@@ -360,17 +372,49 @@ class DeepMind:
             self.logger.debug(f"[时间过滤诊断] 预解析 memory_scope 失败，已忽略: {e}")
 
         time_diagnostic = analyze_time_intent(message_text)
+        recall_policy = getattr(event, "_angel_memory_recall_policy", {}) or {}
+        recall_request = (
+            recall_policy.get("recall_request", {})
+            if isinstance(recall_policy, dict)
+            else {}
+        )
+        if not isinstance(recall_request, dict) or not recall_request:
+            recall_request = analyze_recall_request(message_text)
+        if not isinstance(recall_policy, dict) or not recall_policy:
+            fallback_time_filter = build_time_filter_payload(time_diagnostic)
+            recall_policy = {
+                "recall_request": recall_request,
+                "time_filter": fallback_time_filter,
+                "strict_time_recall": bool(
+                    fallback_time_filter.get("matched") and recall_request.get("matched")
+                ),
+                "restrict_injection": bool(
+                    fallback_time_filter.get("matched") and recall_request.get("matched")
+                ),
+                "skip_notes": bool(
+                    fallback_time_filter.get("matched") and recall_request.get("matched")
+                ),
+                "prefer_raw_chat_only": False,
+            }
+            setattr(event, "_angel_memory_recall_policy", recall_policy)
+        time_filter = (
+            dict(recall_policy.get("time_filter", {}) or {})
+            if isinstance(recall_policy, dict)
+            else {}
+        )
         diagnostic_store.update(
             {
                 "session_id": session_id,
                 "raw_user_input": message_text,
                 "memory_scope_preview": memory_scope_preview,
                 "time_intent": time_diagnostic.to_dict(),
+                "time_filter": time_filter,
+                "recall_request": recall_request,
             }
         )
         self.logger.info(
             f"[时间过滤诊断][输入] session={session_id} payload="
-            f"{json.dumps({'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_diagnostic.to_dict()}, ensure_ascii=False)}"
+            f"{json.dumps({'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_diagnostic.to_dict(), 'recall_request': recall_request, 'time_filter': time_filter}, ensure_ascii=False)}"
         )
 
         # 1. 从 event.angelheart_context 中获取对话历史（仅保留未处理消息）
@@ -450,20 +494,28 @@ class DeepMind:
             return
 
         # 4. 检索长期记忆和笔记
-        retrieval_data = await self._retrieve_memories_and_notes(event, query, precompute_vectors=True)
+        retrieval_data = await self._retrieve_memories_and_notes(
+            event,
+            query,
+            precompute_vectors=True,
+            recall_policy=recall_policy,
+        )
 
         long_term_memories = retrieval_data["long_term_memories"]
         candidate_notes = retrieval_data["candidate_notes"]
         core_topic = retrieval_data["core_topic"]
+        strict_time_recall = bool(recall_policy.get("strict_time_recall")) if isinstance(recall_policy, dict) else False
+        restrict_injection = bool(recall_policy.get("restrict_injection")) if isinstance(recall_policy, dict) else False
+        skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
 
         # 5. 将检索到的长期记忆填入短期记忆
-        if long_term_memories and self.memory_system:
+        if long_term_memories and self.memory_system and not restrict_injection:
             self.session_memory_manager.add_memories_to_session(session_id, long_term_memories)
 
         # 6. 构建笔记上下文（复用NoteContextBuilder）
         note_context = ""
         selected_notes = []
-        if candidate_notes:
+        if candidate_notes and not skip_notes:
             from .utils.note_context_builder import NoteContextBuilder
 
             # Top-K 注入策略：不再按 token 预算裁剪
@@ -493,23 +545,53 @@ class DeepMind:
                 self.logger.warning(f"获取灵魂状态值失败: {e}")
 
         # 8. 注入记忆、笔记和灵魂状态到请求
-        session_memories_for_injection = self.session_memory_manager.get_session_memories(
-            session_id
+        if restrict_injection:
+            session_memories_for_injection = list(long_term_memories or [])
+        else:
+            session_memories_for_injection = self.session_memory_manager.get_session_memories(
+                session_id
+            )
+        raw_chat_recall_rows = (
+            list(recall_policy.get("raw_chat_recall_rows", []) or [])
+            if isinstance(recall_policy, dict)
+            else []
+        )
+        recent_fact_rows = (
+            list(recall_policy.get("recent_fact_rows", []) or [])
+            if isinstance(recall_policy, dict)
+            else []
         )
         injection_diagnostic = {
+            "restrict_injection": restrict_injection,
+            "strict_time_recall": strict_time_recall,
             "session_memory_count": len(session_memories_for_injection),
-            "session_memory_summary": summarize_session_memories(
-                session_memories_for_injection
+            "session_memory_summary": (
+                summarize_memory_records(session_memories_for_injection)
+                if restrict_injection
+                else summarize_session_memories(session_memories_for_injection)
             ),
             "selected_note_count": len(selected_notes),
             "selected_note_summary": summarize_note_records(selected_notes),
             "note_context_preview": preview_text(note_context, 160),
+            "raw_chat_recall_count": len(raw_chat_recall_rows),
+            "raw_chat_recall_summary": summarize_raw_chat_rows(raw_chat_recall_rows),
+            "recent_fact_count": len(recent_fact_rows),
+            "recent_fact_summary": summarize_raw_chat_rows(recent_fact_rows),
         }
         diagnostic_store["final_injection"] = injection_diagnostic
         self.logger.info(
             f"[时间过滤诊断][最终注入预览] session={session_id} payload="
             f"{json.dumps(injection_diagnostic, ensure_ascii=False)}"
         )
+
+        extra_instruction = ""
+        if restrict_injection:
+            extra_instruction = (
+                "本轮是高优先级的回顾问题。"
+                "如果 raw_chat_window 已提供当前 session 的原始聊天记录，必须先以它为准。"
+                "当本轮命中明确时间窗时，长期记忆只能使用同一时间窗内的结果，严禁把窗口外旧记忆、旧笔记或旧 session pool 内容混入“刚才/昨晚/昨天/前面”的回答。"
+                "如果当前回顾范围内已有原始聊天记录，不要直接回复“没有记忆”。"
+            )
 
         has_secretary_decision = bool(secretary_decision)
         self._inject_memories_to_request(
@@ -518,23 +600,29 @@ class DeepMind:
             note_context,
             soul_state_values,
             has_secretary_decision=has_secretary_decision,
+            session_memories_override=session_memories_for_injection if restrict_injection else None,
+            extra_instruction=extra_instruction,
         )
 
         # 9. (异步任务所需) 将原始上下文数据存入event.angelmemory_context
         try:
             memory_id_mapping = MemoryIDResolver.generate_id_mapping([mem.to_dict() for mem in long_term_memories], "id")
             angelmemory_context = {
-                "memories": self._memories_to_json(self.session_memory_manager.get_session_memories(session_id)),
+                "memories": self._memories_to_json(session_memories_for_injection if restrict_injection else self.session_memory_manager.get_session_memories(session_id)),
                 "recall_query": query,
                 "recall_time": time.time(),
                 "session_id": session_id,
                 "user_list": user_list,
                 "raw_chat_records": unprocessed_chat_records,
+                "raw_chat_window_recall_rows": raw_chat_recall_rows,
+                "recent_fact_rows": recent_fact_rows,
                 "raw_memories": [memory.to_dict() for memory in long_term_memories],
                 "raw_notes": candidate_notes,
                 "core_topic": core_topic,
                 "memory_id_mapping": memory_id_mapping,
                 "note_id_mapping": {},
+                "time_filter": time_filter,
+                "recall_request": recall_request,
                 "diagnostic": diagnostic_store,
             }
             event.angelmemory_context = json.dumps(angelmemory_context)

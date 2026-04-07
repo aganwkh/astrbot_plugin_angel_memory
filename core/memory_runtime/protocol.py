@@ -37,6 +37,7 @@ class MemoryRuntime(Protocol):
         event: Any = None,
         vector: Optional[List[float]] = None,
         memory_scope: str = "public",
+        time_filter: Optional[dict] = None,
     ) -> List[BaseMemory]:
         ...
 
@@ -49,6 +50,7 @@ class MemoryRuntime(Protocol):
         vector: Optional[List[float]] = None,
         event: Any = None,
         memory_scope: str = "public",
+        time_filter: Optional[dict] = None,
     ) -> List[BaseMemory]:
         ...
 

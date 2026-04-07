@@ -45,12 +45,22 @@ class DeepMindRetrievalService:
             return None
 
     async def retrieve_memories_and_notes(
-        self, event: AstrMessageEvent, query: str, precompute_vectors: bool = False
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        precompute_vectors: bool = False,
+        recall_policy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         deepmind = self.deepmind
         diagnostic_store = get_event_diagnostic_store(event)
         retrieval_diagnostic = diagnostic_store.setdefault("retrieval", {})
         time_intent = diagnostic_store.get("time_intent", {})
+        recall_policy = recall_policy or getattr(event, "_angel_memory_recall_policy", {}) or {}
+        recall_request = diagnostic_store.get("recall_request", {})
+        time_filter = recall_policy.get("time_filter", {}) if isinstance(recall_policy, dict) else {}
+        strict_time_recall = bool(recall_policy.get("strict_time_recall")) if isinstance(recall_policy, dict) else False
+        prefer_raw_chat_only = bool(recall_policy.get("prefer_raw_chat_only")) if isinstance(recall_policy, dict) else False
+        skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
 
         if precompute_vectors:
             memory_query, memory_vector = (
@@ -63,7 +73,28 @@ class DeepMindRetrievalService:
             memory_vector = None
 
         long_term_memories = []
-        if deepmind.memory_system:
+        if prefer_raw_chat_only:
+            memory_call_payload = {
+                "memory_query": memory_query,
+                "memory_query_preview": preview_text(memory_query, 160),
+                "memory_scope": "",
+                "per_type_limit": 0,
+                "final_limit": 0,
+                "has_precomputed_vector": memory_vector is not None,
+                "time_intent": time_intent,
+                "recall_request": recall_request,
+                "time_filter_passed": bool(time_filter.get("matched")),
+                "time_filter": time_filter,
+                "skipped": True,
+                "skip_reason": "原始聊天回顾优先，跳过自动长期记忆召回。",
+            }
+            retrieval_diagnostic["memory_call"] = memory_call_payload
+            retrieval_diagnostic["memory_result"] = summarize_memory_records([])
+            deepmind.logger.info(
+                "[时间过滤诊断][长期记忆检索入参] payload="
+                f"{json.dumps(memory_call_payload, ensure_ascii=False)}"
+            )
+        elif deepmind.memory_system:
             try:
                 memory_scope = await deepmind.plugin_context.resolve_memory_scope_from_event(
                     event
@@ -91,8 +122,10 @@ class DeepMindRetrievalService:
                     "final_limit": int(dynamic_limit * 1.5),
                     "has_precomputed_vector": memory_vector is not None,
                     "time_intent": time_intent,
-                    "time_filter_passed": False,
-                    "time_filter_note": "自动长期记忆检索链路未传入 start_time/end_time/time_range。",
+                    "recall_request": recall_request,
+                    "time_filter_passed": bool(time_filter.get("matched") and strict_time_recall),
+                    "time_filter": time_filter if strict_time_recall else {},
+                    "time_filter_note": "命中时间回顾问题时，将时间窗透传到底层检索函数。",
                 }
                 retrieval_diagnostic["memory_call"] = memory_call_payload
                 deepmind.logger.info(
@@ -108,6 +141,7 @@ class DeepMindRetrievalService:
                     event=event,
                     vector=memory_vector,
                     memory_scope=memory_scope,
+                    time_filter=time_filter if strict_time_recall else None,
                 )
 
                 memory_result_payload = summarize_memory_records(long_term_memories)
@@ -150,7 +184,27 @@ class DeepMindRetrievalService:
             note_vector = None
 
         candidate_notes = []
-        if deepmind.note_service:
+        if skip_notes:
+            note_call_payload = {
+                "note_query": note_query,
+                "note_query_preview": preview_text(note_query, 160),
+                "recall_count": 0,
+                "top_k": 0,
+                "has_precomputed_vector": note_vector is not None,
+                "time_intent": time_intent,
+                "recall_request": recall_request,
+                "time_filter_passed": bool(time_filter.get("matched") and strict_time_recall),
+                "time_filter": time_filter if strict_time_recall else {},
+                "skipped": True,
+                "skip_reason": "时间窗回顾问题优先避免笔记混入。",
+            }
+            retrieval_diagnostic["note_call"] = note_call_payload
+            retrieval_diagnostic["note_result"] = summarize_note_records([])
+            deepmind.logger.info(
+                "[时间过滤诊断][笔记检索入参] payload="
+                f"{json.dumps(note_call_payload, ensure_ascii=False)}"
+            )
+        elif deepmind.note_service:
             note_call_payload = {
                 "note_query": note_query,
                 "note_query_preview": preview_text(note_query, 160),
@@ -158,8 +212,10 @@ class DeepMindRetrievalService:
                 "top_k": int(deepmind.note_candidate_top_k),
                 "has_precomputed_vector": note_vector is not None,
                 "time_intent": time_intent,
+                "recall_request": recall_request,
                 "time_filter_passed": False,
-                "time_filter_note": "笔记检索接口当前未接收时间窗口参数。",
+                "time_filter": {},
+                "time_filter_note": "时间回顾问题默认跳过笔记；普通问题保持原有笔记检索。",
             }
             retrieval_diagnostic["note_call"] = note_call_payload
             deepmind.logger.info(

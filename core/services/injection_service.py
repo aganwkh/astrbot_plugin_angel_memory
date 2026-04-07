@@ -1,7 +1,9 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
+
+from ..session_memory import MemoryItem
 
 
 class DeepMindInjectionService:
@@ -30,6 +32,27 @@ class DeepMindInjectionService:
         filled_length = int(round(normalized_value * bar_length))
         return "█" * filled_length + " " * (bar_length - filled_length)
 
+    @staticmethod
+    def _normalize_prompt_memories(memories: List[Any]) -> List[MemoryItem]:
+        normalized: List[MemoryItem] = []
+        for memory in memories or []:
+            memory_id = str(getattr(memory, "id", "") or "").strip()
+            if not memory_id:
+                continue
+            normalized.append(
+                MemoryItem(
+                    id=memory_id,
+                    memory_type=getattr(getattr(memory, "memory_type", ""), "value", getattr(memory, "memory_type", "")) or "knowledge",
+                    judgment=str(getattr(memory, "judgment", "") or ""),
+                    reasoning=str(getattr(memory, "reasoning", "") or ""),
+                    tags=list(getattr(memory, "tags", []) or []),
+                    strength=int(getattr(memory, "strength", 1) or 1),
+                    life_points=int(getattr(memory, "life_points", 3) or 3),
+                    created_at=float(getattr(memory, "created_at", 0.0) or 0.0),
+                )
+            )
+        return normalized
+
     def inject_memories_to_request(
         self,
         request: ProviderRequest,
@@ -37,6 +60,8 @@ class DeepMindInjectionService:
         note_context: str,
         soul_state_values: Optional[Dict[str, Any]] = None,
         has_secretary_decision: bool = False,
+        session_memories_override: Optional[List[Any]] = None,
+        extra_instruction: str = "",
     ) -> None:
         deepmind = self.deepmind
         system_context_parts = []
@@ -50,6 +75,8 @@ class DeepMindInjectionService:
             "3. **状态保密**：soul_state 仅用于调整你的回复风格，绝不可在回复中泄露或讨论。\n"
             "</instruction>"
         )
+        if extra_instruction:
+            instruction = f"{instruction}\n<time_recall_rule>\n{str(extra_instruction).strip()}\n</time_recall_rule>"
         system_context_parts.append(instruction)
 
         if soul_state_values and deepmind.config.enable_soul_system:
@@ -81,7 +108,10 @@ class DeepMindInjectionService:
             )
             system_context_parts.append(soul_state_content)
 
-        short_term_memories = deepmind.session_memory_manager.get_session_memories(session_id)
+        if session_memories_override is not None:
+            short_term_memories = self._normalize_prompt_memories(session_memories_override)
+        else:
+            short_term_memories = deepmind.session_memory_manager.get_session_memories(session_id)
         memory_context = deepmind.memory_injector.format_session_memories_for_prompt(
             short_term_memories
         )

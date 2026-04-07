@@ -189,6 +189,7 @@ class CognitiveService:
         event=None,
         vector: Optional[List[float]] = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         """实现双轨检索：同时从新鲜记忆和已巩固记忆中检索相关内容"""
         return await self.memory_manager.comprehensive_recall(
@@ -197,6 +198,7 @@ class CognitiveService:
             event=event,
             vector=vector,
             memory_scope=memory_scope,
+            time_filter=time_filter,
         )
 
     async def consolidate_memories(self):
@@ -213,6 +215,7 @@ class CognitiveService:
         event=None,
         memory_handlers: Dict[str, Any] = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         """链式多通道回忆 - 基于关联网络的多轮回忆
 
@@ -238,6 +241,7 @@ class CognitiveService:
             vector=vector,
             event=event,
             memory_scope=memory_scope,
+            time_filter=time_filter,
         )
 
     async def feedback(

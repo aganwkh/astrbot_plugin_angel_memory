@@ -12,6 +12,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 import asyncio
+from datetime import datetime
 import json
 import logging
 
@@ -30,6 +31,9 @@ from .tools.core_memory_recall import CoreMemoryRecallTool
 from .tools.note_recall import NoteRecallTool
 from .tools.research_tool import ResearchTool
 from .core.utils.time_diagnostics import (
+    analyze_recall_request,
+    analyze_time_intent,
+    build_time_filter_payload,
     get_event_diagnostic_store,
     preview_text,
     summarize_raw_chat_rows,
@@ -58,7 +62,7 @@ def configure_logging_behavior():
     "astrbot_plugin_angel_memory",
     "kawayiYokami",
     "天使的记忆，让astrbot拥有记忆维护系统和开箱即用的知识库检索",
-    "1.3.11",
+    "1.3.12",
     "https://github.com/kawayiYokami/astrbot_plugin_angel_memory"
 )
 class AngelMemoryPlugin(Star):
@@ -160,27 +164,104 @@ class AngelMemoryPlugin(Star):
             ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_session ON chat_window(session_id)')
 
-    def _fetch_recent_raw_chat_records(
-        self, session_id: str, limit: int = 15
+    def _fetch_raw_chat_records(
+        self,
+        session_id: str,
+        limit: int = 15,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        role: str | None = None,
     ) -> list[tuple[str, str, float]]:
         import sqlite3
 
         with sqlite3.connect(self.raw_db_path) as conn:
             cursor = conn.cursor()
+            conditions = ["session_id = ?"]
+            params: list[object] = [session_id]
+            if start_ts is not None and float(start_ts) > 0:
+                conditions.append("timestamp >= ?")
+                params.append(float(start_ts))
+            if end_ts is not None and float(end_ts) > 0:
+                conditions.append("timestamp <= ?")
+                params.append(float(end_ts))
+            if role:
+                conditions.append("role = ?")
+                params.append(str(role))
             cursor.execute(
-                """
+                f"""
                 SELECT role, content, timestamp
                 FROM chat_window
-                WHERE session_id = ?
+                WHERE {' AND '.join(conditions)}
                 ORDER BY timestamp DESC, id DESC
                 LIMIT ?
                 """,
-                (session_id, limit),
+                (*params, int(limit)),
             )
             rows = cursor.fetchall()
 
         rows.reverse()
         return rows
+
+    def _fetch_recent_raw_chat_records(
+        self, session_id: str, limit: int = 15
+    ) -> list[tuple[str, str, float]]:
+        return self._fetch_raw_chat_records(session_id=session_id, limit=limit)
+
+    @staticmethod
+    def _format_raw_chat_timestamp(timestamp: float) -> str:
+        try:
+            ts = float(timestamp or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _build_raw_chat_recall_block(
+        self,
+        rows: list[tuple[str, str, float]],
+        recall_policy: dict,
+    ) -> str:
+        time_filter = recall_policy.get("time_filter", {}) if isinstance(recall_policy, dict) else {}
+        header = str(time_filter.get("intent_type", "") or "时间窗")
+        start_time = str(time_filter.get("start_time", "") or "")
+        end_time = str(time_filter.get("end_time", "") or "")
+        history_text = "\n".join(
+            f"[{self._format_raw_chat_timestamp(timestamp)}] {str(role or '').strip()}: {str(content or '').strip()}"
+            for role, content, timestamp in rows
+        )
+        return (
+            "\n\n【🧭 原始聊天时间窗回顾结果（当前 session 真实物理记录）】\n"
+            f"[回顾类型]：{header or '会话回顾'}\n"
+            f"[时间范围]：{start_time or '(未指定)'} ~ {end_time or '(未指定)'}\n"
+            "[硬规则]：用户此刻在追问“刚才/昨晚/昨天/前面/原话/是不是提过”的内容时，"
+            "必须优先以这里的原始聊天记录为准。若此处已有内容，不要直接回答“没有记忆”。\n"
+            f"{history_text}\n"
+            "【原始聊天时间窗回顾结束】"
+        )
+
+    def _build_recent_fact_block(self, rows: list[tuple[str, str, float]]) -> str:
+        if not rows:
+            return ""
+        fact_lines = "\n".join(
+            f"[{self._format_raw_chat_timestamp(timestamp)}] {str(content or '').strip()}"
+            for _role, content, timestamp in rows
+        )
+        return (
+            "\n\n【🟢 近期精确事实层（当前 session，优先级高于旧长期记忆）】\n"
+            "[硬规则]：以下是用户最近几轮明确说过的动作、状态、计划、对象原话。"
+            "如果这些内容与更早的长期记忆冲突，优先采用这里的近期事实，禁止把新事实说偏成旧主题。\n"
+            f"{fact_lines}\n"
+            "【近期精确事实层结束】"
+        )
+
+    @staticmethod
+    def _extract_user_message_text(event: AstrMessageEvent) -> str:
+        return str(
+            getattr(getattr(event, "message_obj", None), "message_str", "")
+            or getattr(event, "message_str", "")
+            or ""
+        ).strip()
 
     def _build_raw_chat_anchor(self, rows: list[tuple[str, str, float]]) -> str:
         history_text = "\n".join(
@@ -212,6 +293,32 @@ class AngelMemoryPlugin(Star):
         self.logger.info(
             "[时间过滤诊断][原始聊天锚点] payload="
             f"{json.dumps(raw_chat_payload, ensure_ascii=False)}"
+        )
+
+    def _remember_raw_chat_recall_diagnostic(
+        self,
+        event: AstrMessageEvent,
+        session_id: str,
+        rows: list[tuple[str, str, float]],
+        recall_policy: dict,
+    ) -> None:
+        diagnostic_store = get_event_diagnostic_store(event)
+        payload = {
+            "session_id": session_id,
+            "row_count": len(rows),
+            "summary": summarize_raw_chat_rows(rows),
+            "recall_policy": {
+                "strict_time_recall": bool(recall_policy.get("strict_time_recall")),
+                "prefer_raw_chat_only": bool(recall_policy.get("prefer_raw_chat_only")),
+                "time_filter": recall_policy.get("time_filter", {}),
+                "recall_request": recall_policy.get("recall_request", {}),
+            },
+        }
+        diagnostic_store["raw_chat_recall"] = payload
+        setattr(event, "_angel_memory_raw_chat_recall_meta", payload)
+        self.logger.info(
+            "[时间过滤诊断][原始聊天回顾] payload="
+            f"{json.dumps(payload, ensure_ascii=False)}"
         )
 
     @staticmethod
@@ -252,11 +359,17 @@ class AngelMemoryPlugin(Star):
         raw_memories = context_data.get("raw_memories", []) or []
         raw_notes = context_data.get("raw_notes", []) or []
         raw_chat_anchor = diagnostic_store.get("raw_chat_anchor", {})
+        raw_chat_recall = diagnostic_store.get("raw_chat_recall", {})
+        recent_fact_layer = diagnostic_store.get("recent_fact_layer", {})
         final_injection = diagnostic_store.get("final_injection", {})
         no_memory_payload = {
             "response_preview": preview_text(response_text, 160),
             "raw_chat_anchor_count": int(raw_chat_anchor.get("row_count", 0) or 0),
             "raw_chat_anchor_summary": raw_chat_anchor.get("summary", {}),
+            "raw_chat_recall_count": int(raw_chat_recall.get("row_count", 0) or 0),
+            "raw_chat_recall_summary": raw_chat_recall.get("summary", {}),
+            "recent_fact_count": int(recent_fact_layer.get("row_count", 0) or 0),
+            "recent_fact_summary": recent_fact_layer.get("summary", {}),
             "raw_memory_count": len(raw_memories),
             "raw_note_count": len(raw_notes),
             "query_build": diagnostic_store.get("query_build", {}),
@@ -264,7 +377,9 @@ class AngelMemoryPlugin(Star):
             "retrieval": diagnostic_store.get("retrieval", {}),
             "final_injection": final_injection,
             "has_any_candidate": bool(
-                raw_chat_anchor.get("row_count", 0)
+                raw_chat_recall.get("row_count", 0)
+                or recent_fact_layer.get("row_count", 0)
+                or raw_chat_anchor.get("row_count", 0)
                 or raw_memories
                 or raw_notes
                 or final_injection.get("session_memory_count", 0)
@@ -273,7 +388,9 @@ class AngelMemoryPlugin(Star):
             "reason_guess": (
                 "候选为空"
                 if not (
-                    raw_chat_anchor.get("row_count", 0)
+                    raw_chat_recall.get("row_count", 0)
+                    or recent_fact_layer.get("row_count", 0)
+                    or raw_chat_anchor.get("row_count", 0)
                     or raw_memories
                     or raw_notes
                     or final_injection.get("session_memory_count", 0)
@@ -296,9 +413,68 @@ class AngelMemoryPlugin(Star):
             self.logger.debug("[短时记忆锚点] 跳过 原因=缺少有效session_id")
             return
 
+        message_text = self._extract_user_message_text(event)
+        time_intent = analyze_time_intent(message_text)
+        time_filter = build_time_filter_payload(time_intent)
+        recall_request = analyze_recall_request(message_text)
+        matched_phrases = list(recall_request.get("matched_phrases", []) or [])
+        exact_raw_chat_only = bool(
+            recall_request.get("raw_chat_priority")
+            and (
+                time_intent.intent_type in {"刚才", "前面"}
+                or any(
+                    phrase in {"原话", "原句", "说了什么", "说过什么", "说的什么", "说了啥"}
+                    for phrase in matched_phrases
+                )
+            )
+        )
+        strict_time_recall = bool(time_filter.get("matched") and recall_request.get("matched"))
+
         try:
-            rows = await asyncio.to_thread(
-                self._fetch_recent_raw_chat_records, session_id, 15
+            raw_chat_recall_rows: list[tuple[str, str, float]] = []
+            if strict_time_recall:
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    30,
+                    float(time_filter.get("start_ts", 0.0) or 0.0),
+                    float(time_filter.get("end_ts", 0.0) or 0.0),
+                    None,
+                )
+            elif recall_request.get("raw_chat_priority"):
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+
+            if not raw_chat_recall_rows and time_intent.intent_type in {"刚才", "前面"}:
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+
+            recent_user_rows = await asyncio.to_thread(
+                self._fetch_raw_chat_records,
+                session_id,
+                6,
+                None,
+                None,
+                "User",
+            )
+            rows = (
+                raw_chat_recall_rows
+                if raw_chat_recall_rows
+                else await asyncio.to_thread(
+                    self._fetch_recent_raw_chat_records, session_id, 15
+                )
             )
         except Exception as e:
             self.logger.warning(
@@ -307,19 +483,66 @@ class AngelMemoryPlugin(Star):
             )
             return
 
-        if not rows:
+        if not rows and not recent_user_rows:
             self.logger.debug(
                 f"[短时记忆锚点] 跳过 session={session_id} 原因=无物理对话记录"
             )
             return
 
-        self._remember_raw_chat_diagnostic(event, session_id, rows)
+        recall_policy = {
+            "recall_request": recall_request,
+            "time_filter": time_filter,
+            "strict_time_recall": strict_time_recall,
+            "prefer_raw_chat_only": bool(raw_chat_recall_rows and exact_raw_chat_only),
+            "restrict_injection": bool(strict_time_recall or (raw_chat_recall_rows and exact_raw_chat_only)),
+            "skip_notes": bool(strict_time_recall or (raw_chat_recall_rows and exact_raw_chat_only)),
+            "raw_chat_recall_rows": raw_chat_recall_rows,
+            "recent_fact_rows": recent_user_rows,
+        }
+        setattr(event, "_angel_memory_recall_policy", recall_policy)
+
+        diagnostic_store = get_event_diagnostic_store(event)
+        diagnostic_store["recall_request"] = recall_request
+        diagnostic_store["time_filter"] = time_filter
+        diagnostic_store["recall_policy"] = {
+            "strict_time_recall": bool(recall_policy.get("strict_time_recall")),
+            "prefer_raw_chat_only": bool(recall_policy.get("prefer_raw_chat_only")),
+            "restrict_injection": bool(recall_policy.get("restrict_injection")),
+            "skip_notes": bool(recall_policy.get("skip_notes")),
+        }
+
+        system_prompt_suffix = ""
+        if raw_chat_recall_rows:
+            self._remember_raw_chat_recall_diagnostic(
+                event,
+                session_id,
+                raw_chat_recall_rows,
+                recall_policy,
+            )
+            system_prompt_suffix += self._build_raw_chat_recall_block(
+                raw_chat_recall_rows,
+                recall_policy,
+            )
+
+        if recent_user_rows:
+            diagnostic_store["recent_fact_layer"] = {
+                "session_id": session_id,
+                "row_count": len(recent_user_rows),
+                "summary": summarize_raw_chat_rows(recent_user_rows),
+            }
+            system_prompt_suffix += self._build_recent_fact_block(recent_user_rows)
+
+        if rows:
+            self._remember_raw_chat_diagnostic(event, session_id, rows)
+            system_prompt_suffix += self._build_raw_chat_anchor(rows)
+
         request.system_prompt = (
             f"{str(getattr(request, 'system_prompt', '') or '')}"
-            f"{self._build_raw_chat_anchor(rows)}"
+            f"{system_prompt_suffix}"
         )
         self.logger.info(
-            f"[短时记忆锚点] 完成 session={session_id} 注入条数={len(rows)}"
+            f"[短时记忆锚点] 完成 session={session_id} "
+            f"anchor条数={len(rows)} 回顾条数={len(raw_chat_recall_rows)} 近期事实条数={len(recent_user_rows)}"
         )
 
     def _load_complete_config(self):

@@ -157,6 +157,61 @@ class MemoryManager:
             return scope == "public"
         return scope in {target, "public"}
 
+    @staticmethod
+    def _normalize_time_filter(time_filter: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(time_filter, dict):
+            return {}
+        try:
+            start_ts = float(time_filter.get("start_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            start_ts = 0.0
+        try:
+            end_ts = float(time_filter.get("end_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            end_ts = 0.0
+        matched = bool(time_filter.get("matched")) and start_ts > 0 and end_ts >= start_ts
+        if not matched:
+            return {}
+        normalized = dict(time_filter)
+        normalized["matched"] = True
+        normalized["start_ts"] = start_ts
+        normalized["end_ts"] = end_ts
+        return normalized
+
+    @classmethod
+    def _build_query_where_filter(
+        cls,
+        memory_scope: str,
+        time_filter: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        scope_filter = cls._build_scope_where_filter(memory_scope)
+        normalized_time_filter = cls._normalize_time_filter(time_filter)
+        if not normalized_time_filter:
+            return scope_filter
+        return {
+            "$and": [
+                scope_filter,
+                {"created_at": {"$gte": float(normalized_time_filter["start_ts"])}},
+                {"created_at": {"$lte": float(normalized_time_filter["end_ts"])}},
+            ]
+        }
+
+    @classmethod
+    def _matches_time_filter(
+        cls, memory: BaseMemory, time_filter: Optional[Dict[str, Any]]
+    ) -> bool:
+        normalized_time_filter = cls._normalize_time_filter(time_filter)
+        if not normalized_time_filter:
+            return True
+        try:
+            created_at = float(getattr(memory, "created_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        return (
+            created_at >= float(normalized_time_filter["start_ts"])
+            and created_at <= float(normalized_time_filter["end_ts"])
+        )
+
     async def comprehensive_recall(
         self,
         query: str,
@@ -164,6 +219,7 @@ class MemoryManager:
         event=None,
         vector: Optional[List[float]] = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         """
         统一记忆检索 - 使用混合检索获取所有相关记忆。
@@ -184,6 +240,7 @@ class MemoryManager:
                 query, event
             )
 
+        normalized_time_filter = self._normalize_time_filter(time_filter)
         self.logger.info(
             "[时间过滤诊断][MemoryManager综合检索入参] payload="
             f"{json.dumps({
@@ -192,14 +249,18 @@ class MemoryManager:
                 'limit': int(limit) if limit is not None else None,
                 'memory_scope': str(memory_scope or ''),
                 'has_vector': vector is not None,
-                'time_filter_supported': False,
-                'time_filter_note': 'MemoryManager.comprehensive_recall 仅构造 scope where_filter。'
+                'time_filter_supported': True,
+                'time_filter': normalized_time_filter,
+                'time_filter_note': '命中时间窗时，先做硬过滤，再在窗口内排序。'
             }, ensure_ascii=False)}"
         )
 
         if limit is None:
             limit = system_config.fresh_recall_limit
-        where_filter = self._build_scope_where_filter(memory_scope)
+        where_filter = self._build_query_where_filter(
+            memory_scope=memory_scope,
+            time_filter=normalized_time_filter,
+        )
 
         if self.memory_sql_manager is not None and self.memory_index_collection is not None:
             id_scores = await self.store.recall_memory_ids(
@@ -215,12 +276,14 @@ class MemoryManager:
                 limit=limit * 3,
                 memory_scope=memory_scope,
                 vector_scores=score_map if score_map else None,
+                time_filter=normalized_time_filter,
             )
             if hybrid_memories:
                 self.logger.info(
                     "[时间过滤诊断][MemoryManager综合检索结果] payload="
                     f"{json.dumps({
                         'mode': 'hybrid_sql',
+                        'time_filter_applied': bool(normalized_time_filter),
                         'result_summary': summarize_memory_records(hybrid_memories[:limit]),
                     }, ensure_ascii=False)}"
                 )
@@ -234,6 +297,8 @@ class MemoryManager:
             for mem in sql_memories:
                 if not self._is_scope_allowed(getattr(mem, "memory_scope", "public"), memory_scope):
                     continue
+                if not self._matches_time_filter(mem, normalized_time_filter):
+                    continue
                 mem.similarity = float(score_map.get(mem.id, 0.0))
                 filtered.append(mem)
             filtered.sort(key=lambda m: getattr(m, "similarity", 0.0), reverse=True)
@@ -241,6 +306,7 @@ class MemoryManager:
                 "[时间过滤诊断][MemoryManager综合检索结果] payload="
                 f"{json.dumps({
                     'mode': 'vector_ids_plus_sql',
+                    'time_filter_applied': bool(normalized_time_filter),
                     'result_summary': summarize_memory_records(filtered[:limit]),
                 }, ensure_ascii=False)}"
             )
@@ -289,6 +355,7 @@ class MemoryManager:
             "[时间过滤诊断][MemoryManager综合检索结果] payload="
             f"{json.dumps({
                 'mode': 'vector_only',
+                'time_filter_applied': bool(normalized_time_filter),
                 'result_summary': summarize_memory_records(memories[:limit]),
             }, ensure_ascii=False)}"
         )
@@ -304,6 +371,7 @@ class MemoryManager:
         event=None,
         vector: Optional[List[float]] = None,
         memory_scope: str = "public",
+        time_filter: Optional[Dict[str, Any]] = None,
     ) -> List[BaseMemory]:
         """
         链式回忆 - 混合检索 + 实体优先 + 类型分组
@@ -325,6 +393,7 @@ class MemoryManager:
         if self.query_processor and event:
             processed_query = self.query_processor.process_query_for_memory(query, event)
 
+        normalized_time_filter = self._normalize_time_filter(time_filter)
         self.logger.info(
             "[时间过滤诊断][MemoryManager链式召回入参] payload="
             f"{json.dumps({
@@ -334,8 +403,9 @@ class MemoryManager:
                 'per_type_limit': int(per_type_limit),
                 'final_limit': int(final_limit),
                 'memory_scope': str(memory_scope or ''),
-                'time_filter_supported': False,
-                'time_filter_note': '链式召回阶段只消费候选池，不额外施加时间约束。'
+                'time_filter_supported': True,
+                'time_filter': normalized_time_filter,
+                'time_filter_note': '候选池已按时间窗硬过滤，链式阶段只在窗口内继续筛选。'
             }, ensure_ascii=False)}"
         )
 
@@ -346,11 +416,13 @@ class MemoryManager:
             event=event,
             vector=vector,
             memory_scope=memory_scope,
+            time_filter=normalized_time_filter,
         )
         self.logger.info(
             "[时间过滤诊断][MemoryManager链式召回候选池] payload="
             f"{json.dumps({
                 'candidate_count': len(candidate_pool),
+                'time_filter_applied': bool(normalized_time_filter),
                 'candidate_summary': summarize_memory_records(candidate_pool),
             }, ensure_ascii=False)}"
         )
@@ -389,6 +461,7 @@ class MemoryManager:
             f"{json.dumps({
                 'entity_count': len(entity_memories),
                 'typed_count': sum(len(v) for v in type_memories.values()),
+                'time_filter_applied': bool(normalized_time_filter),
                 'result_summary': summarize_memory_records(all_memories),
             }, ensure_ascii=False)}"
         )
