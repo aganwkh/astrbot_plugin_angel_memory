@@ -12,6 +12,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 import asyncio
+import json
 import logging
 
 try:
@@ -28,6 +29,11 @@ from .tools.core_memory_remember import CoreMemoryRememberTool
 from .tools.core_memory_recall import CoreMemoryRecallTool
 from .tools.note_recall import NoteRecallTool
 from .tools.research_tool import ResearchTool
+from .core.utils.time_diagnostics import (
+    get_event_diagnostic_store,
+    preview_text,
+    summarize_raw_chat_rows,
+)
 
 
 def configure_logging_behavior():
@@ -52,7 +58,7 @@ def configure_logging_behavior():
     "astrbot_plugin_angel_memory",
     "kawayiYokami",
     "天使的记忆，让astrbot拥有记忆维护系统和开箱即用的知识库检索",
-    "1.3.10",
+    "1.3.11",
     "https://github.com/kawayiYokami/astrbot_plugin_angel_memory"
 )
 class AngelMemoryPlugin(Star):
@@ -156,14 +162,14 @@ class AngelMemoryPlugin(Star):
 
     def _fetch_recent_raw_chat_records(
         self, session_id: str, limit: int = 15
-    ) -> list[tuple[str, str]]:
+    ) -> list[tuple[str, str, float]]:
         import sqlite3
 
         with sqlite3.connect(self.raw_db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT role, content
+                SELECT role, content, timestamp
                 FROM chat_window
                 WHERE session_id = ?
                 ORDER BY timestamp DESC, id DESC
@@ -176,16 +182,110 @@ class AngelMemoryPlugin(Star):
         rows.reverse()
         return rows
 
-    def _build_raw_chat_anchor(self, rows: list[tuple[str, str]]) -> str:
+    def _build_raw_chat_anchor(self, rows: list[tuple[str, str, float]]) -> str:
         history_text = "\n".join(
             f"{str(role or '').strip()}: {str(content or '').strip()}"
-            for role, content in rows
+            for role, content, _timestamp in rows
         )
         return (
             "\n\n【🔴 绝对时序锚点：以下是用户近期的真实物理对话记录，不受任何框架截断影响。"
             "优先级最高！如果用户询问'刚才'、'前面'的内容，或验证其原话，必须且只能以此记录为准！】\n"
             f"{history_text}\n"
             "【锚点结束，回到当前对话状态。】"
+        )
+
+    def _remember_raw_chat_diagnostic(
+        self,
+        event: AstrMessageEvent,
+        session_id: str,
+        rows: list[tuple[str, str, float]],
+    ) -> None:
+        diagnostic_store = get_event_diagnostic_store(event)
+        raw_chat_summary = summarize_raw_chat_rows(rows)
+        raw_chat_payload = {
+            "session_id": session_id,
+            "row_count": len(rows),
+            "summary": raw_chat_summary,
+        }
+        diagnostic_store["raw_chat_anchor"] = raw_chat_payload
+        setattr(event, "_angel_memory_raw_chat_anchor_meta", raw_chat_payload)
+        self.logger.info(
+            "[时间过滤诊断][原始聊天锚点] payload="
+            f"{json.dumps(raw_chat_payload, ensure_ascii=False)}"
+        )
+
+    @staticmethod
+    def _extract_response_text(response) -> str:
+        if response is None:
+            return ""
+        return str(getattr(response, "completion_text", response) or "")
+
+    @staticmethod
+    def _looks_like_no_memory_response(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        keywords = [
+            "没有记忆",
+            "没找到记录",
+            "没有记录",
+            "不记得",
+            "记不清",
+            "想不起来",
+        ]
+        return any(keyword in normalized for keyword in keywords)
+
+    def _log_no_memory_response_diagnostic(
+        self,
+        event: AstrMessageEvent,
+        response_text: str,
+    ) -> None:
+        diagnostic_store = get_event_diagnostic_store(event)
+        angelmemory_context_raw = getattr(event, "angelmemory_context", None)
+        context_data = {}
+        if angelmemory_context_raw:
+            try:
+                context_data = json.loads(angelmemory_context_raw)
+            except (json.JSONDecodeError, TypeError):
+                context_data = {}
+
+        raw_memories = context_data.get("raw_memories", []) or []
+        raw_notes = context_data.get("raw_notes", []) or []
+        raw_chat_anchor = diagnostic_store.get("raw_chat_anchor", {})
+        final_injection = diagnostic_store.get("final_injection", {})
+        no_memory_payload = {
+            "response_preview": preview_text(response_text, 160),
+            "raw_chat_anchor_count": int(raw_chat_anchor.get("row_count", 0) or 0),
+            "raw_chat_anchor_summary": raw_chat_anchor.get("summary", {}),
+            "raw_memory_count": len(raw_memories),
+            "raw_note_count": len(raw_notes),
+            "query_build": diagnostic_store.get("query_build", {}),
+            "query_pipeline": diagnostic_store.get("query_pipeline", {}),
+            "retrieval": diagnostic_store.get("retrieval", {}),
+            "final_injection": final_injection,
+            "has_any_candidate": bool(
+                raw_chat_anchor.get("row_count", 0)
+                or raw_memories
+                or raw_notes
+                or final_injection.get("session_memory_count", 0)
+                or final_injection.get("selected_note_count", 0)
+            ),
+            "reason_guess": (
+                "候选为空"
+                if not (
+                    raw_chat_anchor.get("row_count", 0)
+                    or raw_memories
+                    or raw_notes
+                    or final_injection.get("session_memory_count", 0)
+                    or final_injection.get("selected_note_count", 0)
+                )
+                else "存在候选但模型仍返回无记忆，需要结合上方链路日志判断被哪一步冲淡"
+            ),
+        }
+        diagnostic_store["no_memory_response_check"] = no_memory_payload
+        self.logger.info(
+            "[时间过滤诊断][无记忆答复核查] payload="
+            f"{json.dumps(no_memory_payload, ensure_ascii=False)}"
         )
 
     async def _inject_recent_raw_chat_anchor(
@@ -213,6 +313,7 @@ class AngelMemoryPlugin(Star):
             )
             return
 
+        self._remember_raw_chat_diagnostic(event, session_id, rows)
         request.system_prompt = (
             f"{str(getattr(request, 'system_prompt', '') or '')}"
             f"{self._build_raw_chat_anchor(rows)}"
@@ -378,21 +479,22 @@ class AngelMemoryPlugin(Star):
             # 将响应数据存储到event上下文中，供after_message_sent使用
             if hasattr(event, "angelmemory_context"):
                 try:
-                    import json
                     import time
 
                     context_data = json.loads(event.angelmemory_context)
                     # 添加响应数据
                     context_data["llm_response"] = {
-                        "completion_text": getattr(response, "completion_text", str(response))
-                        if response
-                        else "",
+                        "completion_text": self._extract_response_text(response),
                         "timestamp": time.time(),
                     }
                     event.angelmemory_context = json.dumps(context_data)
                     self.logger.debug("LLM响应数据已存储到event上下文")
                 except (json.JSONDecodeError, AttributeError, TypeError) as e:
                     self.logger.warning(f"存储响应数据失败: {e}")
+
+            response_text = self._extract_response_text(response)
+            if self._looks_like_no_memory_response(response_text):
+                self._log_no_memory_response_diagnostic(event, response_text)
 
         except Exception as e:
             self.logger.error(f"on_llm_response failed: {e}")

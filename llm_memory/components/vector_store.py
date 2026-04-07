@@ -6,6 +6,7 @@
 
 import chromadb
 import inspect
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 import traceback
@@ -13,6 +14,7 @@ from pathlib import Path
 from .embedding_provider import EmbeddingProvider
 from ..utils.path_manager import PathManager
 from .tag_manager import TagManager
+from ...core.utils.time_diagnostics import summarize_memory_records
 
 # 导入日志记录器
 try:
@@ -1155,6 +1157,16 @@ class VectorStore:
             return vector_results[:limit]
 
         try:
+            self.logger.info(
+                "[时间过滤诊断][向量重排入参] payload="
+                f"{json.dumps({
+                    'query_preview': str(query or '')[:160],
+                    'candidate_count': len(vector_results),
+                    'candidate_summary': summarize_memory_records(vector_results),
+                    'time_filter_supported': False,
+                    'time_filter_note': 'VectorStore._rerank_results 只向 rerank_provider 传递 query/documents。'
+                }, ensure_ascii=False)}"
+            )
             passages = []
             documents: List[str] = []
             id_to_index: Dict[str, int] = {}
@@ -1195,6 +1207,14 @@ class VectorStore:
                 return vector_results[:limit]
 
             reordered = self._reorder_results_by_score(vector_results, ranked_scores, collection)
+            self.logger.info(
+                "[时间过滤诊断][向量重排结果] payload="
+                f"{json.dumps({
+                    'candidate_count': len(vector_results),
+                    'reranked_count': len(reordered[:limit]),
+                    'result_summary': summarize_memory_records(reordered[:limit]),
+                }, ensure_ascii=False)}"
+            )
             return reordered[:limit]
         except Exception as e:
             self.logger.warning(f"记忆重排失败，降级为向量排序: {e}")

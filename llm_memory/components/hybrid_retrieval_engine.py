@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import inspect
+import json
 from typing import Any, Callable, Dict, List, Optional
+
+try:
+    from astrbot.api import logger
+except ImportError:
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 
 class HybridRetrievalEngine:
@@ -10,6 +18,7 @@ class HybridRetrievalEngine:
     def __init__(self, retriever: Any, rerank_provider: Optional[Any] = None):
         self.retriever = retriever
         self.rerank_provider = rerank_provider
+        self.logger = logger
 
     def has_rerank(self) -> bool:
         return self.rerank_provider is not None and hasattr(self.rerank_provider, "rerank")
@@ -65,6 +74,16 @@ class HybridRetrievalEngine:
             return []
 
         try:
+            self.logger.info(
+                "[时间过滤诊断][SimpleMemory重排入参] payload="
+                f"{json.dumps({
+                    'query_preview': str(query or '')[:160],
+                    'candidate_count': len(ordered_ids),
+                    'candidate_ids': ordered_ids[:10],
+                    'time_filter_supported': False,
+                    'time_filter_note': 'HybridRetrievalEngine.rerank_candidates 只接收 query/documents。'
+                }, ensure_ascii=False)}"
+            )
             passages: List[Dict[str, str]] = []
             documents: List[str] = []
             for item_id in ordered_ids:
@@ -118,6 +137,13 @@ class HybridRetrievalEngine:
             scored.sort(
                 key=lambda x: (float(x.get("final_score", 0.0)), -int(x.get("rank_index", 0))),
                 reverse=True,
+            )
+            self.logger.info(
+                "[时间过滤诊断][SimpleMemory重排结果] payload="
+                f"{json.dumps({
+                    'reranked_count': len(scored),
+                    'top_ids': [row.get('id') for row in scored[:10]],
+                }, ensure_ascii=False)}"
             )
             return scored
         except Exception:

@@ -4,6 +4,12 @@ from typing import Any, Dict, Optional
 from astrbot.api.event import AstrMessageEvent
 
 from ..utils.memory_id_resolver import MemoryIDResolver
+from ..utils.time_diagnostics import (
+    get_event_diagnostic_store,
+    preview_text,
+    summarize_memory_records,
+    summarize_note_records,
+)
 
 
 class DeepMindRetrievalService:
@@ -42,6 +48,9 @@ class DeepMindRetrievalService:
         self, event: AstrMessageEvent, query: str, precompute_vectors: bool = False
     ) -> Dict[str, Any]:
         deepmind = self.deepmind
+        diagnostic_store = get_event_diagnostic_store(event)
+        retrieval_diagnostic = diagnostic_store.setdefault("retrieval", {})
+        time_intent = diagnostic_store.get("time_intent", {})
 
         if precompute_vectors:
             memory_query, memory_vector = (
@@ -56,7 +65,9 @@ class DeepMindRetrievalService:
         long_term_memories = []
         if deepmind.memory_system:
             try:
-                memory_scope = await deepmind.plugin_context.resolve_memory_scope_from_event(event)
+                memory_scope = await deepmind.plugin_context.resolve_memory_scope_from_event(
+                    event
+                )
                 rag_fields = deepmind.query_processor.extract_rag_fields(event)
                 entities = rag_fields.get("entities", [])
 
@@ -65,10 +76,29 @@ class DeepMindRetrievalService:
                     try:
                         dynamic_limit = deepmind.soul.get_value("RecallDepth")
                         deepmind.logger.info(
-                            f"🧠 灵魂回忆深度: {dynamic_limit} (E={deepmind.soul.energy['RecallDepth']:.1f})"
+                            f"🧠 灵魂回忆深度: {dynamic_limit} "
+                            f"(E={deepmind.soul.energy['RecallDepth']:.1f})"
                         )
                     except Exception as e:
                         deepmind.logger.warning(f"获取灵魂参数失败，使用默认值: {e}")
+
+                memory_call_payload = {
+                    "memory_query": memory_query,
+                    "memory_query_preview": preview_text(memory_query, 160),
+                    "entities": list(entities or [])[:10],
+                    "memory_scope": str(memory_scope or ""),
+                    "per_type_limit": int(dynamic_limit),
+                    "final_limit": int(dynamic_limit * 1.5),
+                    "has_precomputed_vector": memory_vector is not None,
+                    "time_intent": time_intent,
+                    "time_filter_passed": False,
+                    "time_filter_note": "自动长期记忆检索链路未传入 start_time/end_time/time_range。",
+                }
+                retrieval_diagnostic["memory_call"] = memory_call_payload
+                deepmind.logger.info(
+                    "[时间过滤诊断][长期记忆检索入参] payload="
+                    f"{json.dumps(memory_call_payload, ensure_ascii=False)}"
+                )
 
                 long_term_memories = await deepmind.memory_system.chained_recall(
                     query=memory_query,
@@ -78,6 +108,13 @@ class DeepMindRetrievalService:
                     event=event,
                     vector=memory_vector,
                     memory_scope=memory_scope,
+                )
+
+                memory_result_payload = summarize_memory_records(long_term_memories)
+                retrieval_diagnostic["memory_result"] = memory_result_payload
+                deepmind.logger.info(
+                    "[时间过滤诊断][长期记忆检索结果] payload="
+                    f"{json.dumps(memory_result_payload, ensure_ascii=False)}"
                 )
 
                 if deepmind.soul:
@@ -90,6 +127,7 @@ class DeepMindRetrievalService:
                         deepmind.soul.resonate(snapshots)
 
             except Exception as e:
+                retrieval_diagnostic["memory_error"] = {"error": str(e)}
                 deepmind.logger.error(f"链式召回失败，跳过记忆检索: {e}")
                 long_term_memories = []
 
@@ -113,11 +151,34 @@ class DeepMindRetrievalService:
 
         candidate_notes = []
         if deepmind.note_service:
+            note_call_payload = {
+                "note_query": note_query,
+                "note_query_preview": preview_text(note_query, 160),
+                "recall_count": int(deepmind.note_candidate_top_k),
+                "top_k": int(deepmind.note_candidate_top_k),
+                "has_precomputed_vector": note_vector is not None,
+                "time_intent": time_intent,
+                "time_filter_passed": False,
+                "time_filter_note": "笔记检索接口当前未接收时间窗口参数。",
+            }
+            retrieval_diagnostic["note_call"] = note_call_payload
+            deepmind.logger.info(
+                "[时间过滤诊断][笔记检索入参] payload="
+                f"{json.dumps(note_call_payload, ensure_ascii=False)}"
+            )
+
             candidate_notes = await deepmind.note_service.search_notes_by_top_k(
                 query=note_query,
                 recall_count=deepmind.note_candidate_top_k,
                 top_k=deepmind.note_candidate_top_k,
                 vector=note_vector,
+            )
+
+            note_result_payload = summarize_note_records(candidate_notes)
+            retrieval_diagnostic["note_result"] = note_result_payload
+            deepmind.logger.info(
+                "[时间过滤诊断][笔记检索结果] payload="
+                f"{json.dumps(note_result_payload, ensure_ascii=False)}"
             )
 
         memory_id_mapping = {}

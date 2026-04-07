@@ -6,6 +6,7 @@
 """
 
 from typing import List, Optional, Dict, Any
+import json
 import logging
 import time
 from collections import defaultdict
@@ -21,6 +22,7 @@ from .memory_decay_policy import MemoryDecayConfig, MemoryDecayPolicy
 
 # 导入查询处理器（用于统一检索词预处理）
 from ...core.utils.query_processor import get_query_processor
+from ...core.utils.time_diagnostics import preview_text, summarize_memory_records
 
 
 class MemoryManager:
@@ -182,6 +184,19 @@ class MemoryManager:
                 query, event
             )
 
+        self.logger.info(
+            "[时间过滤诊断][MemoryManager综合检索入参] payload="
+            f"{json.dumps({
+                'query_preview': preview_text(query, 160),
+                'processed_query_preview': preview_text(processed_query, 160),
+                'limit': int(limit) if limit is not None else None,
+                'memory_scope': str(memory_scope or ''),
+                'has_vector': vector is not None,
+                'time_filter_supported': False,
+                'time_filter_note': 'MemoryManager.comprehensive_recall 仅构造 scope where_filter。'
+            }, ensure_ascii=False)}"
+        )
+
         if limit is None:
             limit = system_config.fresh_recall_limit
         where_filter = self._build_scope_where_filter(memory_scope)
@@ -202,6 +217,13 @@ class MemoryManager:
                 vector_scores=score_map if score_map else None,
             )
             if hybrid_memories:
+                self.logger.info(
+                    "[时间过滤诊断][MemoryManager综合检索结果] payload="
+                    f"{json.dumps({
+                        'mode': 'hybrid_sql',
+                        'result_summary': summarize_memory_records(hybrid_memories[:limit]),
+                    }, ensure_ascii=False)}"
+                )
                 return hybrid_memories[:limit]
 
             if not id_scores:
@@ -215,6 +237,13 @@ class MemoryManager:
                 mem.similarity = float(score_map.get(mem.id, 0.0))
                 filtered.append(mem)
             filtered.sort(key=lambda m: getattr(m, "similarity", 0.0), reverse=True)
+            self.logger.info(
+                "[时间过滤诊断][MemoryManager综合检索结果] payload="
+                f"{json.dumps({
+                    'mode': 'vector_ids_plus_sql',
+                    'result_summary': summarize_memory_records(filtered[:limit]),
+                }, ensure_ascii=False)}"
+            )
             return filtered[:limit]
 
         # 直接使用混合检索，相似度阈值0.5
@@ -256,6 +285,13 @@ class MemoryManager:
         if batch_updates:
             await self.store.update_memory(self.collection, batch_updates)
 
+        self.logger.info(
+            "[时间过滤诊断][MemoryManager综合检索结果] payload="
+            f"{json.dumps({
+                'mode': 'vector_only',
+                'result_summary': summarize_memory_records(memories[:limit]),
+            }, ensure_ascii=False)}"
+        )
         return memories
 
     async def chained_recall(
@@ -289,6 +325,20 @@ class MemoryManager:
         if self.query_processor and event:
             processed_query = self.query_processor.process_query_for_memory(query, event)
 
+        self.logger.info(
+            "[时间过滤诊断][MemoryManager链式召回入参] payload="
+            f"{json.dumps({
+                'query_preview': preview_text(query, 160),
+                'processed_query_preview': preview_text(processed_query, 160),
+                'entities': list(entities or [])[:10],
+                'per_type_limit': int(per_type_limit),
+                'final_limit': int(final_limit),
+                'memory_scope': str(memory_scope or ''),
+                'time_filter_supported': False,
+                'time_filter_note': '链式召回阶段只消费候选池，不额外施加时间约束。'
+            }, ensure_ascii=False)}"
+        )
+
         # 步骤1: 混合检索获取候选池（相似度≥0.5的所有记忆）
         candidate_pool = await self.comprehensive_recall(
             query=processed_query,
@@ -296,6 +346,13 @@ class MemoryManager:
             event=event,
             vector=vector,
             memory_scope=memory_scope,
+        )
+        self.logger.info(
+            "[时间过滤诊断][MemoryManager链式召回候选池] payload="
+            f"{json.dumps({
+                'candidate_count': len(candidate_pool),
+                'candidate_summary': summarize_memory_records(candidate_pool),
+            }, ensure_ascii=False)}"
         )
 
         # 步骤2: 从候选池提取实体记忆（每个实体最多3条）
@@ -327,6 +384,14 @@ class MemoryManager:
         all_memories = entity_memories + [mem for mems in type_memories.values() for mem in mems]
 
         self.logger.debug(f"链式回忆: 实体记忆={len(entity_memories)}, 类型记忆={sum(len(v) for v in type_memories.values())}, 总计={len(all_memories)}")
+        self.logger.info(
+            "[时间过滤诊断][MemoryManager链式召回结果] payload="
+            f"{json.dumps({
+                'entity_count': len(entity_memories),
+                'typed_count': sum(len(v) for v in type_memories.values()),
+                'result_summary': summarize_memory_records(all_memories),
+            }, ensure_ascii=False)}"
+        )
 
         return all_memories
 

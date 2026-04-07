@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -18,6 +19,7 @@ except ImportError:
 from ..config.system_config import system_config
 from ..models.data_models import BaseMemory, MemoryType, ValidationError
 from ..service.memory_decay_policy import MemoryDecayConfig, MemoryDecayPolicy
+from ...core.utils.time_diagnostics import preview_text, summarize_memory_records
 from .bm25_retriever import TantivyBM25Retriever
 from .hybrid_retrieval_engine import HybridRetrievalEngine
 
@@ -1585,6 +1587,19 @@ class MemorySqlManager:
         if not text:
             return []
 
+        self.logger.info(
+            "[时间过滤诊断][SimpleMemory检索入参] payload="
+            f"{json.dumps({
+                'query_preview': preview_text(text, 160),
+                'limit': int(limit),
+                'memory_scope': str(memory_scope or ''),
+                'has_vector_scores': bool(vector_scores),
+                'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+                'time_filter_supported': False,
+                'time_filter_note': 'recall_by_tags 未接收时间窗口参数，仅做 scope 和分数过滤。'
+            }, ensure_ascii=False)}"
+        )
+
         self._ensure_fts_ready_sync()
         candidate_limit = max(20, int(limit) * 20)
         bm25_limit = max(50, int(limit) * 30)
@@ -1607,6 +1622,14 @@ class MemorySqlManager:
             build_doc_text_map=self._build_memory_doc_text_map_by_ids,
         )
         if not hits:
+            self.logger.info(
+                "[时间过滤诊断][SimpleMemory检索结果] payload="
+                f"{json.dumps({
+                    'hit_count': 0,
+                    'time_filter_supported': False,
+                    'result_summary': summarize_memory_records([]),
+                }, ensure_ascii=False)}"
+            )
             return []
 
         ordered_ids = [
@@ -1636,6 +1659,15 @@ class MemorySqlManager:
             ordered.append(mem)
             if len(ordered) >= int(limit):
                 break
+        self.logger.info(
+            "[时间过滤诊断][SimpleMemory检索结果] payload="
+            f"{json.dumps({
+                'hit_count': len(hits),
+                'ordered_count': len(ordered),
+                'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+                'result_summary': summarize_memory_records(ordered),
+            }, ensure_ascii=False)}"
+        )
         return ordered
 
     async def reinforce_memories(self, memory_ids: List[str], delta: int = 1) -> None:
@@ -1939,6 +1971,10 @@ class MemorySqlManager:
 
     async def recall_by_time(self, time_range: str, memory_scope: str) -> List[BaseMemory]:
         """第三批次新增：基于时间维度的硬性检索"""
+        self.logger.info(
+            "[时间过滤诊断][按时间硬过滤入参] payload="
+            f"{json.dumps({'time_range': str(time_range or ''), 'memory_scope': str(memory_scope or '')}, ensure_ascii=False)}"
+        )
         return await asyncio.to_thread(self._recall_by_time_sync, time_range, memory_scope)
 
     def _recall_by_time_sync(self, time_range: str, memory_scope: str) -> List[BaseMemory]:
@@ -2056,7 +2092,20 @@ class MemorySqlManager:
             rows = conn.execute(sql, (start_ts, end_ts, *scope_params)).fetchall()
             tags_map = self._fetch_tags_for_memory_ids(conn, [str(row["id"]) for row in rows])
             
-        return [self._row_to_memory(row, tags_map.get(str(row["id"]), [])) for row in rows]       
+        memories = [
+            self._row_to_memory(row, tags_map.get(str(row["id"]), [])) for row in rows
+        ]
+        self.logger.info(
+            "[时间过滤诊断][按时间硬过滤结果] payload="
+            f"{json.dumps({
+                'time_range': str(time_range or ''),
+                'memory_scope': str(memory_scope or ''),
+                'start_ts': float(start_ts),
+                'end_ts': float(end_ts),
+                'result_summary': summarize_memory_records(memories),
+            }, ensure_ascii=False)}"
+        )
+        return memories
 
     def shutdown(self) -> None:
         self.close()

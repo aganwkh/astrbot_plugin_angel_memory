@@ -7,11 +7,13 @@
 
 import asyncio
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .id_service import IDService
+from ...core.utils.time_diagnostics import preview_text, summarize_note_records
 
 try:
     from astrbot.api import logger
@@ -96,8 +98,28 @@ class NoteService:
         vector: Optional[List[float]] = None,
     ) -> List[Dict]:
         del tag_filter
+        self.logger.info(
+            "[时间过滤诊断][笔记服务检索入参] payload="
+            f"{json.dumps({
+                'query_preview': preview_text(query, 160),
+                'recall_count': int(recall_count),
+                'top_k': int(top_k),
+                'has_vector': vector is not None,
+                'time_filter_supported': False,
+                'time_filter_note': 'NoteService.search_notes_by_top_k 未接收时间窗口参数。'
+            }, ensure_ascii=False)}"
+        )
         candidates = await self._search_notes_v2(query=query, recall_count=recall_count, vector=vector)
-        return candidates[: max(0, int(top_k))]
+        selected = candidates[: max(0, int(top_k))]
+        self.logger.info(
+            "[时间过滤诊断][笔记服务检索结果] payload="
+            f"{json.dumps({
+                'candidate_count': len(candidates),
+                'selected_count': len(selected),
+                'summary': summarize_note_records(selected),
+            }, ensure_ascii=False)}"
+        )
+        return selected
 
     async def _search_notes_v2(
         self,
@@ -106,6 +128,16 @@ class NoteService:
         vector: Optional[List[float]] = None,
     ) -> List[Dict]:
         memory_sql_manager = self._get_memory_sql_manager()
+        self.logger.info(
+            "[时间过滤诊断][笔记底层检索] payload="
+            f"{json.dumps({
+                'query_preview': preview_text(query, 160),
+                'recall_count': int(recall_count),
+                'has_vector': vector is not None,
+                'time_filter_supported': False,
+                'time_filter_note': '底层笔记检索仅接收 query/recall_count/vector。'
+            }, ensure_ascii=False)}"
+        )
 
         rows: List[Dict] = []
         if self.vector_store is not None and self.notes_index_collection is not None:

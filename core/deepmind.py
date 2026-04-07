@@ -17,6 +17,14 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from .soul.soul_state import SoulState
 from .utils.memory_id_resolver import MemoryIDResolver
+from .utils.time_diagnostics import (
+    analyze_time_intent,
+    compare_time_intent,
+    get_event_diagnostic_store,
+    preview_text,
+    summarize_note_records,
+    summarize_session_memories,
+)
 from ..llm_memory.utils.json_parser import JsonParser
 from .session_memory import SessionMemoryManager
 from .memory_runtime import MemoryRuntime
@@ -341,6 +349,29 @@ class DeepMind:
         event.plugin_context = self.plugin_context
 
         session_id = self._get_session_id(event)
+        message_text = self._extract_message_text(event) or ""
+        diagnostic_store = get_event_diagnostic_store(event)
+        memory_scope_preview = ""
+        try:
+            memory_scope_preview = await self.plugin_context.resolve_memory_scope_from_event(
+                event
+            )
+        except Exception as e:
+            self.logger.debug(f"[时间过滤诊断] 预解析 memory_scope 失败，已忽略: {e}")
+
+        time_diagnostic = analyze_time_intent(message_text)
+        diagnostic_store.update(
+            {
+                "session_id": session_id,
+                "raw_user_input": message_text,
+                "memory_scope_preview": memory_scope_preview,
+                "time_intent": time_diagnostic.to_dict(),
+            }
+        )
+        self.logger.info(
+            f"[时间过滤诊断][输入] session={session_id} payload="
+            f"{json.dumps({'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_diagnostic.to_dict()}, ensure_ascii=False)}"
+        )
 
         # 1. 从 event.angelheart_context 中获取对话历史（仅保留未处理消息）
         chat_records: List[Dict[str, Any]] = []
@@ -364,6 +395,7 @@ class DeepMind:
         # 2. 从 secretary_decision 构建查询字符串
         query = ""
         user_list = []
+        query_build_branch = "unknown"
 
         if secretary_decision:
             # 从 secretary_decision 构建查询词
@@ -384,15 +416,36 @@ class DeepMind:
                 query_parts.extend(keywords[:3])  # 限制关键词数量
 
             query = " ".join(query_parts)
+            query_build_branch = "secretary_decision"
         else:
             # 降级到原始逻辑
             if not unprocessed_chat_records:
-                message_text = self._extract_message_text(event)
                 query = message_text if message_text else ""
+                query_build_branch = "raw_message"
             else:
                 query, user_list = self.prompt_builder.format_chat_records(unprocessed_chat_records)
+                query_build_branch = "raw_chat_records"
 
         # 3. 如果未配置 provider_id，跳过记忆整理
+        raw_to_intermediate = compare_time_intent(message_text, query)
+        query_build_payload = {
+            "branch": query_build_branch,
+            "intermediate_query": query,
+            "intermediate_query_preview": preview_text(query, 160),
+            "time_intent_from_raw_to_intermediate": raw_to_intermediate,
+            "secretary_topic": preview_text(
+                str(secretary_decision.get("topic", "") or ""), 80
+            ),
+            "secretary_entities": list(secretary_decision.get("entities", []) or [])[:5],
+            "secretary_facts": list(secretary_decision.get("facts", []) or [])[:3],
+            "secretary_keywords": list(secretary_decision.get("keywords", []) or [])[:3],
+        }
+        diagnostic_store["query_build"] = query_build_payload
+        self.logger.info(
+            f"[时间过滤诊断][query构建] session={session_id} payload="
+            f"{json.dumps(query_build_payload, ensure_ascii=False)}"
+        )
+
         if not self.provider_id:
             return
 
@@ -409,6 +462,7 @@ class DeepMind:
 
         # 6. 构建笔记上下文（复用NoteContextBuilder）
         note_context = ""
+        selected_notes = []
         if candidate_notes:
             from .utils.note_context_builder import NoteContextBuilder
 
@@ -439,6 +493,24 @@ class DeepMind:
                 self.logger.warning(f"获取灵魂状态值失败: {e}")
 
         # 8. 注入记忆、笔记和灵魂状态到请求
+        session_memories_for_injection = self.session_memory_manager.get_session_memories(
+            session_id
+        )
+        injection_diagnostic = {
+            "session_memory_count": len(session_memories_for_injection),
+            "session_memory_summary": summarize_session_memories(
+                session_memories_for_injection
+            ),
+            "selected_note_count": len(selected_notes),
+            "selected_note_summary": summarize_note_records(selected_notes),
+            "note_context_preview": preview_text(note_context, 160),
+        }
+        diagnostic_store["final_injection"] = injection_diagnostic
+        self.logger.info(
+            f"[时间过滤诊断][最终注入预览] session={session_id} payload="
+            f"{json.dumps(injection_diagnostic, ensure_ascii=False)}"
+        )
+
         has_secretary_decision = bool(secretary_decision)
         self._inject_memories_to_request(
             request,
@@ -462,7 +534,8 @@ class DeepMind:
                 "raw_notes": candidate_notes,
                 "core_topic": core_topic,
                 "memory_id_mapping": memory_id_mapping,
-                "note_id_mapping": {}
+                "note_id_mapping": {},
+                "diagnostic": diagnostic_store,
             }
             event.angelmemory_context = json.dumps(angelmemory_context)
         except Exception as e:
