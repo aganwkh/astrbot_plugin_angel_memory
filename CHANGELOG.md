@@ -2,6 +2,20 @@
 
 All notable changes to this plugin will be documented in this file.
 
+## [14.0] - 2026-04-10
+
+### 新增 (Added)
+- **独立短时记忆物理层**：新增基于 SQLite 的 `raw_chat_window.db`，实现独立于语义总结层的滑动窗口机制，硬性留存每个 Session 的最新 50 条原始真实对话。
+- **绝对时序锚点强制注入**：引入 `time_diagnostics` 模块解析用户时间意图。在请求阶段 (`on_llm_request`) 通过 `_inject_recent_raw_chat_anchor` 将最近 15~30 条原始记录打包为强指令事实层，强制追加至 System Prompt 末尾。
+- **时间维度硬过滤检索**：`core_memory_recall` 工具参数新增 `time_range` 字段（包含 21 种标准化时间枚举）。执行时优先触发 SQL 级的时间区间硬检索 (`recall_by_time`)，未命中或无时间参数时回落至默认混合检索。
+- **失忆诊断机制**：在响应阶段 (`on_llm_response`) 新增 `_log_no_memory_response_diagnostic`，当大模型回复“没有记忆”、“不记得”等拒答话术时，自动捕获上下文锚点与检索链路状态并记录排障日志。
+
+### 变更与优化 (Changed)
+- **强化长期记忆时空隔离**：重构 `MemoryInjector.inject_into_system_prompt`，废弃原始裸文本拼接。采用视觉分隔符与强警告指令（声明“发生于过去”、“绝非当前发言”）包裹长期记忆，根除模型将历史事实当作当前请求的幻觉现象。
+- **收紧回忆工具触发约束**：在 `core_memory_recall` 的系统描述中追加“【强制指令】”，明令禁止模型在面对用户核对原话、追问历史或质疑记忆断层时凭空推断。
+- **优雅停机安全优化**：修改插件 `terminate` 生命周期，为后台未完成的记忆入库和整理任务赋予 15 秒执行宽限期 (`asyncio.wait(..., timeout=15.0)`)，保障数据安全落盘。
+- **版本号升级**：基础配置由 `1.2.8` 升级至 `1.3.12`。
+
 ## [1.3.9] - 2026-03-22
 
 ### Highlights
