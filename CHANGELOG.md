@@ -2,7 +2,7 @@
 
 All notable changes to this plugin will be documented in this file.
 
-## [14.0] - 2026-04-10
+## [1.4.0] - 2026-04-10
 
 ### 新增 (Added)
 - **独立短时记忆物理层**：新增基于 SQLite 的 `raw_chat_window.db`，实现独立于语义总结层的滑动窗口机制，硬性留存每个 Session 的最新 50 条原始真实对话。
