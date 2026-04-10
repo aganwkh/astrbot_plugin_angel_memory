@@ -1758,6 +1758,7 @@ class MemorySqlManager:
                     JOIN global_tags gt ON gt.id = mtr.tag_id
                     GROUP BY mtr.memory_id
                 ) tags ON tags.memory_id = mr.id
+                WHERE mr.is_archived = 0
             """
             rows = conn.execute(sql).fetchall()
 
@@ -1819,18 +1820,18 @@ class MemorySqlManager:
 
         normalized_time_filter = self._normalize_time_filter(time_filter)
 
+        payload = {
+            'query_preview': preview_text(text, 160),
+            'limit': int(limit),
+            'memory_scope': str(memory_scope or ''),
+            'has_vector_scores': bool(vector_scores),
+            'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+            'time_filter_supported': True,
+            'time_filter': normalized_time_filter,
+            'time_filter_note': '命中时间窗时，先在 SQL 中硬过滤 created_at，再在窗口内排序。',
+        }
         self.logger.info(
-            "[时间过滤诊断][SimpleMemory检索入参] payload="
-            f"{json.dumps({
-                'query_preview': preview_text(text, 160),
-                'limit': int(limit),
-                'memory_scope': str(memory_scope or ''),
-                'has_vector_scores': bool(vector_scores),
-                'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
-                'time_filter_supported': True,
-                'time_filter': normalized_time_filter,
-                'time_filter_note': '命中时间窗时，先在 SQL 中硬过滤 created_at，再在窗口内排序。'
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][SimpleMemory检索入参] payload={json.dumps(payload, ensure_ascii=False)}"
         )
 
         if normalized_time_filter:
@@ -1842,14 +1843,14 @@ class MemorySqlManager:
                 window_limit,
             )
             if not candidate_memories:
+                payload = {
+                    'hit_count': 0,
+                    'time_filter_applied': True,
+                    'window_candidate_count': 0,
+                    'result_summary': summarize_memory_records([]),
+                }
                 self.logger.info(
-                    "[时间过滤诊断][SimpleMemory检索结果] payload="
-                    f"{json.dumps({
-                        'hit_count': 0,
-                        'time_filter_applied': True,
-                        'window_candidate_count': 0,
-                        'result_summary': summarize_memory_records([]),
-                    }, ensure_ascii=False)}"
+                    f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
                 )
                 return []
 
@@ -1860,16 +1861,16 @@ class MemorySqlManager:
                 vector_scores=vector_scores,
                 time_filter=normalized_time_filter,
             )
+            payload = {
+                'hit_count': len(candidate_memories),
+                'ordered_count': len(ordered),
+                'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+                'time_filter_applied': True,
+                'window_candidate_count': len(candidate_memories),
+                'result_summary': summarize_memory_records(ordered),
+            }
             self.logger.info(
-                "[时间过滤诊断][SimpleMemory检索结果] payload="
-                f"{json.dumps({
-                    'hit_count': len(candidate_memories),
-                    'ordered_count': len(ordered),
-                    'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
-                    'time_filter_applied': True,
-                    'window_candidate_count': len(candidate_memories),
-                    'result_summary': summarize_memory_records(ordered),
-                }, ensure_ascii=False)}"
+                f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
             )
             return ordered
 
@@ -1895,13 +1896,13 @@ class MemorySqlManager:
             build_doc_text_map=self._build_memory_doc_text_map_by_ids,
         )
         if not hits:
-            self.logger.info(
-                "[时间过滤诊断][SimpleMemory检索结果] payload="
-                f"{json.dumps({
+            payload = {
                 'hit_count': 0,
-                    'time_filter_applied': False,
-                    'result_summary': summarize_memory_records([]),
-                }, ensure_ascii=False)}"
+                'time_filter_applied': False,
+                'result_summary': summarize_memory_records([]),
+            }
+            self.logger.info(
+                f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
             )
             return []
 
@@ -1932,15 +1933,15 @@ class MemorySqlManager:
             ordered.append(mem)
             if len(ordered) >= int(limit):
                 break
+        payload = {
+            'hit_count': len(hits),
+            'ordered_count': len(ordered),
+            'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
+            'time_filter_applied': False,
+            'result_summary': summarize_memory_records(ordered),
+        }
         self.logger.info(
-            "[时间过滤诊断][SimpleMemory检索结果] payload="
-            f"{json.dumps({
-                'hit_count': len(hits),
-                'ordered_count': len(ordered),
-                'rerank_enabled': bool(self._hybrid_engine.has_rerank()),
-                'time_filter_applied': False,
-                'result_summary': summarize_memory_records(ordered),
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return ordered
 
@@ -2065,7 +2066,7 @@ class MemorySqlManager:
             conn.commit()
             return int(cur.rowcount or 0)
 
-    async def consolidate_memories(self) -> None:
+    async def consolidate_memories(self) -> List[str]:
         # T0 时间衰减（T1/T2 不参与自然遗忘）
         await self.natural_decay_tier0()
         deleted_ids: List[str] = []
@@ -2083,6 +2084,7 @@ class MemorySqlManager:
             
         # 同步将这些归档的记忆从高速检索引擎 (FTS/向量) 中剔除
         self._sync_memory_fts_batch_sync(delete_ids=deleted_ids)
+        return deleted_ids
 
     def _get_memories_by_ids_sync(self, memory_ids: List[str]) -> List[BaseMemory]:
         ids = [str(mid).strip() for mid in (memory_ids or []) if str(mid).strip()]
@@ -2096,7 +2098,7 @@ class MemorySqlManager:
                        is_active, useful_count, useful_score, last_recalled_at,
                        memory_scope, created_at
                 FROM memory_records
-                WHERE id IN ({placeholders})
+                WHERE id IN ({placeholders}) AND is_archived = 0
                 """,
                 tuple(ids),
             ).fetchall()
@@ -2245,9 +2247,12 @@ class MemorySqlManager:
 
     async def recall_by_time(self, time_range: str, memory_scope: str) -> List[BaseMemory]:
         """第三批次新增：基于时间维度的硬性检索"""
+        payload = {
+            'time_range': str(time_range or ''),
+            'memory_scope': str(memory_scope or ''),
+        }
         self.logger.info(
-            "[时间过滤诊断][按时间硬过滤入参] payload="
-            f"{json.dumps({'time_range': str(time_range or ''), 'memory_scope': str(memory_scope or '')}, ensure_ascii=False)}"
+            f"[时间过滤诊断][按时间硬过滤入参] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return await asyncio.to_thread(self._recall_by_time_sync, time_range, memory_scope)
 
@@ -2369,15 +2374,15 @@ class MemorySqlManager:
         memories = [
             self._row_to_memory(row, tags_map.get(str(row["id"]), [])) for row in rows
         ]
+        payload = {
+            'time_range': str(time_range or ''),
+            'memory_scope': str(memory_scope or ''),
+            'start_ts': float(start_ts),
+            'end_ts': float(end_ts),
+            'result_summary': summarize_memory_records(memories),
+        }
         self.logger.info(
-            "[时间过滤诊断][按时间硬过滤结果] payload="
-            f"{json.dumps({
-                'time_range': str(time_range or ''),
-                'memory_scope': str(memory_scope or ''),
-                'start_ts': float(start_ts),
-                'end_ts': float(end_ts),
-                'result_summary': summarize_memory_records(memories),
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][按时间硬过滤结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return memories
 

@@ -71,7 +71,14 @@ class MemoryManager:
         self.logger.debug("开始记忆清理过程...")
 
         if self.memory_sql_manager is not None:
-            await self.memory_sql_manager.consolidate_memories()
+            deleted_ids = await self.memory_sql_manager.consolidate_memories()
+            if deleted_ids and self.memory_index_collection is not None:
+                import asyncio
+                try:
+                    await asyncio.to_thread(self.memory_index_collection.delete, ids=deleted_ids)
+                    self.logger.debug(f"已从 memory_index 同步删除 {len(deleted_ids)} 条已归档记忆的向量")
+                except Exception as e:
+                    self.logger.warning(f"从 memory_index 同步清理已归档记忆向量失败: {e}")
             return
 
         try:
@@ -241,18 +248,18 @@ class MemoryManager:
             )
 
         normalized_time_filter = self._normalize_time_filter(time_filter)
+        payload = {
+            'query_preview': preview_text(query, 160),
+            'processed_query_preview': preview_text(processed_query, 160),
+            'limit': int(limit) if limit is not None else None,
+            'memory_scope': str(memory_scope or ''),
+            'has_vector': vector is not None,
+            'time_filter_supported': True,
+            'time_filter': normalized_time_filter,
+            'time_filter_note': '命中时间窗时，先做硬过滤，再在窗口内排序。',
+        }
         self.logger.info(
-            "[时间过滤诊断][MemoryManager综合检索入参] payload="
-            f"{json.dumps({
-                'query_preview': preview_text(query, 160),
-                'processed_query_preview': preview_text(processed_query, 160),
-                'limit': int(limit) if limit is not None else None,
-                'memory_scope': str(memory_scope or ''),
-                'has_vector': vector is not None,
-                'time_filter_supported': True,
-                'time_filter': normalized_time_filter,
-                'time_filter_note': '命中时间窗时，先做硬过滤，再在窗口内排序。'
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][MemoryManager综合检索入参] payload={json.dumps(payload, ensure_ascii=False)}"
         )
 
         if limit is None:
@@ -279,13 +286,13 @@ class MemoryManager:
                 time_filter=normalized_time_filter,
             )
             if hybrid_memories:
+                payload = {
+                    'mode': 'hybrid_sql',
+                    'time_filter_applied': bool(normalized_time_filter),
+                    'result_summary': summarize_memory_records(hybrid_memories[:limit]),
+                }
                 self.logger.info(
-                    "[时间过滤诊断][MemoryManager综合检索结果] payload="
-                    f"{json.dumps({
-                        'mode': 'hybrid_sql',
-                        'time_filter_applied': bool(normalized_time_filter),
-                        'result_summary': summarize_memory_records(hybrid_memories[:limit]),
-                    }, ensure_ascii=False)}"
+                    f"[时间过滤诊断][MemoryManager综合检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
                 )
                 return hybrid_memories[:limit]
 
@@ -302,13 +309,13 @@ class MemoryManager:
                 mem.similarity = float(score_map.get(mem.id, 0.0))
                 filtered.append(mem)
             filtered.sort(key=lambda m: getattr(m, "similarity", 0.0), reverse=True)
+            payload = {
+                'mode': 'vector_ids_plus_sql',
+                'time_filter_applied': bool(normalized_time_filter),
+                'result_summary': summarize_memory_records(filtered[:limit]),
+            }
             self.logger.info(
-                "[时间过滤诊断][MemoryManager综合检索结果] payload="
-                f"{json.dumps({
-                    'mode': 'vector_ids_plus_sql',
-                    'time_filter_applied': bool(normalized_time_filter),
-                    'result_summary': summarize_memory_records(filtered[:limit]),
-                }, ensure_ascii=False)}"
+                f"[时间过滤诊断][MemoryManager综合检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
             )
             return filtered[:limit]
 
@@ -351,13 +358,13 @@ class MemoryManager:
         if batch_updates:
             await self.store.update_memory(self.collection, batch_updates)
 
+        payload = {
+            'mode': 'vector_only',
+            'time_filter_applied': bool(normalized_time_filter),
+            'result_summary': summarize_memory_records(memories[:limit]),
+        }
         self.logger.info(
-            "[时间过滤诊断][MemoryManager综合检索结果] payload="
-            f"{json.dumps({
-                'mode': 'vector_only',
-                'time_filter_applied': bool(normalized_time_filter),
-                'result_summary': summarize_memory_records(memories[:limit]),
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][MemoryManager综合检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return memories
 
@@ -394,19 +401,19 @@ class MemoryManager:
             processed_query = self.query_processor.process_query_for_memory(query, event)
 
         normalized_time_filter = self._normalize_time_filter(time_filter)
+        payload = {
+            'query_preview': preview_text(query, 160),
+            'processed_query_preview': preview_text(processed_query, 160),
+            'entities': list(entities or [])[:10],
+            'per_type_limit': int(per_type_limit),
+            'final_limit': int(final_limit),
+            'memory_scope': str(memory_scope or ''),
+            'time_filter_supported': True,
+            'time_filter': normalized_time_filter,
+            'time_filter_note': '候选池已按时间窗硬过滤，链式阶段只在窗口内继续筛选。',
+        }
         self.logger.info(
-            "[时间过滤诊断][MemoryManager链式召回入参] payload="
-            f"{json.dumps({
-                'query_preview': preview_text(query, 160),
-                'processed_query_preview': preview_text(processed_query, 160),
-                'entities': list(entities or [])[:10],
-                'per_type_limit': int(per_type_limit),
-                'final_limit': int(final_limit),
-                'memory_scope': str(memory_scope or ''),
-                'time_filter_supported': True,
-                'time_filter': normalized_time_filter,
-                'time_filter_note': '候选池已按时间窗硬过滤，链式阶段只在窗口内继续筛选。'
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][MemoryManager链式召回入参] payload={json.dumps(payload, ensure_ascii=False)}"
         )
 
         # 步骤1: 混合检索获取候选池（相似度≥0.5的所有记忆）
@@ -418,13 +425,13 @@ class MemoryManager:
             memory_scope=memory_scope,
             time_filter=normalized_time_filter,
         )
+        payload = {
+            'candidate_count': len(candidate_pool),
+            'time_filter_applied': bool(normalized_time_filter),
+            'candidate_summary': summarize_memory_records(candidate_pool),
+        }
         self.logger.info(
-            "[时间过滤诊断][MemoryManager链式召回候选池] payload="
-            f"{json.dumps({
-                'candidate_count': len(candidate_pool),
-                'time_filter_applied': bool(normalized_time_filter),
-                'candidate_summary': summarize_memory_records(candidate_pool),
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][MemoryManager链式召回候选池] payload={json.dumps(payload, ensure_ascii=False)}"
         )
 
         # 步骤2: 从候选池提取实体记忆（每个实体最多3条）
@@ -456,14 +463,14 @@ class MemoryManager:
         all_memories = entity_memories + [mem for mems in type_memories.values() for mem in mems]
 
         self.logger.debug(f"链式回忆: 实体记忆={len(entity_memories)}, 类型记忆={sum(len(v) for v in type_memories.values())}, 总计={len(all_memories)}")
+        payload = {
+            'entity_count': len(entity_memories),
+            'typed_count': sum(len(v) for v in type_memories.values()),
+            'time_filter_applied': bool(normalized_time_filter),
+            'result_summary': summarize_memory_records(all_memories),
+        }
         self.logger.info(
-            "[时间过滤诊断][MemoryManager链式召回结果] payload="
-            f"{json.dumps({
-                'entity_count': len(entity_memories),
-                'typed_count': sum(len(v) for v in type_memories.values()),
-                'time_filter_applied': bool(normalized_time_filter),
-                'result_summary': summarize_memory_records(all_memories),
-            }, ensure_ascii=False)}"
+            f"[时间过滤诊断][MemoryManager链式召回结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
 
         return all_memories
@@ -653,29 +660,28 @@ class MemoryManager:
                 merge_groups=merge_groups,
                 memory_scope=memory_scope,
             )
-            # 修复：中央库模式合并记忆时，同步删除向量索引并为合并记忆写入新向量
-            if merge_groups and self.memory_index_collection is not None:
-                ids_to_delete = []
-                for group in merge_groups:
-                    if isinstance(group, list):
-                        ids_to_delete.extend([str(mid) for mid in group if mid])
+            if self.memory_index_collection is not None:
+                if merge_groups:
+                    ids_to_delete = []
+                    for group in merge_groups:
+                        if isinstance(group, list):
+                            ids_to_delete.extend([str(mid) for mid in group if mid])
 
-                if ids_to_delete:
-                    try:
-                        import asyncio
-                        await asyncio.to_thread(
-                            self.memory_index_collection.delete,
-                            ids=ids_to_delete,
-                        )
-                        self.logger.debug(
-                            f"已从 memory_index 删除 {len(ids_to_delete)} 条合并前的记忆向量"
-                        )
-                    except Exception as e:
-                        self.logger.warning(
-                            f"从 memory_index 删除合并记忆向量失败: {e}"
-                        )
+                    if ids_to_delete:
+                        try:
+                            import asyncio
+                            await asyncio.to_thread(
+                                self.memory_index_collection.delete,
+                                ids=ids_to_delete,
+                            )
+                            self.logger.debug(
+                                f"已从 memory_index 删除 {len(ids_to_delete)} 条合并前的记忆向量"
+                            )
+                        except Exception as e:
+                            self.logger.warning(
+                                f"从 memory_index 删除合并记忆向量失败: {e}"
+                            )
 
-                # 为新合并记忆写入向量索引（不嵌套在 ids_to_delete 内，upsert 是幂等的）
                 if result:
                     rows_to_index = []
                     for merged_memory in result:
@@ -696,11 +702,11 @@ class MemoryManager:
                                 rows=rows_to_index,
                             )
                             self.logger.debug(
-                                f"已为 {len(rows_to_index)} 个合并记忆添加向量索引"
+                                f"已为 {len(rows_to_index)} 个新记忆/合并记忆添加向量索引"
                             )
                         except Exception as e:
                             self.logger.warning(
-                                f"为合并记忆添加向量索引失败（不影响主流程）: {e}"
+                                f"为记忆添加向量索引失败（不影响主流程）: {e}"
                             )
             return result
 
