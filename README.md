@@ -79,7 +79,7 @@
 
 2. **安装Angel Memory插件**
    ```bash
-   git clone https://github.com/kawayiYokami/astrbot_plugin_angel_memory.git
+   git clone https://github.com/aganwkh/astrbot_plugin_angel_memory.git
    ```
 
 3. **安装依赖**
