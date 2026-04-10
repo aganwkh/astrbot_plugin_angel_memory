@@ -2,6 +2,24 @@
 
 All notable changes to this plugin will be documented in this file.
 
+## [1.4.1] - 2026-04-10
+
+### 🐛 修复 (Fixed)
+
+**核心记忆系统与向量数据生命周期 (Core Memory & Vector Lifecycle)**
+* **[致命] 新记忆入库丢失：** 修复了 `llm_memory/service/memory_manager.py` 中 `process_feedback` 函数的缩进逻辑错误。解决了仅产生新记忆而未触发合并时，向量写入代码被跳过，导致“新鲜记忆”只存入 SQL 而未能同步写入 Chroma 向量库的严重断层问题。
+* **[高危] 废弃记忆死灰复燃：** 修复了睡眠维护阶段 (`consolidate_memories`) 仅在 SQL 层做逻辑归档 (`is_archived = 1`)，但未在 Chroma 层进行物理删除的漏洞。现在底层处理完毕后会正确返回归档 ID 列表，由顶层同步清空对应的向量缓存。
+* **[高危] 脏数据全量回灌：** 修复了轻量向量索引全量导出 (`_list_memory_index_rows_sync`) 时遗漏 `is_archived = 0` 过滤条件的 Bug，阻断了已废弃记忆在系统同步时重新污染向量库的路径。
+* **[中危] 僵尸 ID 越权解析：** 增强了底层 ID 查询器 (`_get_memories_by_ids_sync`) 的数据隔离屏障，强制追加 `is_archived = 0` 校验，彻底拦截上游检索引擎传导的已归档僵尸 ID。
+
+**系统兼容性与稳定性 (Compatibility & Stability)**
+* **[兼容性] Python 3.10 语法崩溃：** 重构了 `memory_manager.py` 与 `memory_sql_manager.py` 中的时间过滤诊断日志代码。将 `f-string` 内嵌的多行 `json.dumps()` 提取为外部变量，修复了 Python 3.10 环境下触发的 `SyntaxError: unterminated string literal` 致命报错。
+
+### 🧪 测试 (Tests)
+
+* 新增 `tests/test_memory_manager_regression.py` 隔离回归测试集。
+* 实现了针对 `process_feedback`（非合并新记忆写入验证）和 `consolidate_memories`（归档向量同步清理验证）的 Mock 覆盖测试，确保核心生命周期不再出现退化。
+
 ## [1.4.0] - 2026-04-10
 
 ### 新增 (Added)
