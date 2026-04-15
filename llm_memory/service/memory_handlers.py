@@ -58,6 +58,7 @@ class MemoryHandler:
         is_active: bool = False,
         strength: Optional[int] = None,
         memory_scope: str = "public",
+        time_metadata: Optional[dict] = None,
     ) -> BaseMemory:
         """
         记住一条记忆。
@@ -84,6 +85,7 @@ class MemoryHandler:
                 is_active=is_active,
                 strength=actual_strength,
                 memory_scope=memory_scope,
+                time_metadata=time_metadata,
             )
             if self.memory_index_collection is not None:
                 try:
@@ -109,6 +111,12 @@ class MemoryHandler:
             is_active=is_active,
             strength=actual_strength,
             memory_scope=memory_scope,
+            source_message_ids=(time_metadata or {}).get("source_message_ids", []),
+            source_start_ts=(time_metadata or {}).get("source_start_ts", 0.0),
+            source_end_ts=(time_metadata or {}).get("source_end_ts", 0.0),
+            event_start_ts=(time_metadata or {}).get("event_start_ts", 0.0),
+            event_end_ts=(time_metadata or {}).get("event_end_ts", 0.0),
+            event_time_confidence=(time_metadata or {}).get("event_time_confidence", ""),
         )
         await self.store.remember(self.collection, memory)
         return memory

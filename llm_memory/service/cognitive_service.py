@@ -134,6 +134,7 @@ class CognitiveService:
         is_active: bool = False,
         strength: Optional[int] = None,
         memory_scope: str = "public",
+        time_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         记住一条记忆。
@@ -151,7 +152,13 @@ class CognitiveService:
         """
         handler = self.memory_handler_factory.get_handler(memory_type)
         memory = await handler.remember(
-            judgment, reasoning, tags, is_active, strength, memory_scope
+            judgment,
+            reasoning,
+            tags,
+            is_active,
+            strength,
+            memory_scope,
+            time_metadata=time_metadata,
         )
         return memory.id
 

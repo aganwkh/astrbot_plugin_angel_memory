@@ -20,6 +20,21 @@ except ImportError:
 from ..config.system_config import system_config
 from ..models.data_models import BaseMemory, MemoryType, ValidationError
 from ..service.memory_decay_policy import MemoryDecayConfig, MemoryDecayPolicy
+from ...core.utils.memory_time import (
+    TIME_CONFIDENCE_EXACT,
+    TIME_CONFIDENCE_INFERRED,
+    TIME_CONFIDENCE_LOW,
+    apply_time_metadata_defaults,
+    build_result_time_usage,
+    classify_memory_time_match,
+    get_memory_time_fields,
+    normalize_source_message_ids,
+    primary_timestamp,
+    primary_timestamp_field,
+    safe_float,
+    summarize_memories_by_time_field,
+    time_sort_boost,
+)
 from ...core.utils.time_diagnostics import preview_text, summarize_memory_records
 from .bm25_retriever import TantivyBM25Retriever
 from .hybrid_retrieval_engine import HybridRetrievalEngine
@@ -92,6 +107,12 @@ class MemorySqlManager:
                     last_recalled_at REAL NOT NULL DEFAULT 0,
                     last_decay_at REAL NOT NULL DEFAULT 0,
                     memory_scope TEXT NOT NULL,
+                    source_message_ids TEXT NOT NULL DEFAULT '[]',
+                    source_start_ts REAL NOT NULL DEFAULT 0,
+                    source_end_ts REAL NOT NULL DEFAULT 0,
+                    event_start_ts REAL NOT NULL DEFAULT 0,
+                    event_end_ts REAL NOT NULL DEFAULT 0,
+                    event_time_confidence TEXT NOT NULL DEFAULT 'low_confidence',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -130,6 +151,10 @@ class MemorySqlManager:
 
                 CREATE INDEX IF NOT EXISTS idx_memory_scope_created_at
                     ON memory_records(memory_scope, created_at);
+                CREATE INDEX IF NOT EXISTS idx_memory_scope_event_time
+                    ON memory_records(memory_scope, event_start_ts, event_end_ts);
+                CREATE INDEX IF NOT EXISTS idx_memory_scope_source_time
+                    ON memory_records(memory_scope, source_start_ts, source_end_ts);
                 CREATE INDEX IF NOT EXISTS idx_memory_active_strength
                     ON memory_records(is_active, strength);
                 CREATE INDEX IF NOT EXISTS idx_memory_judgment
@@ -211,6 +236,30 @@ class MemorySqlManager:
                 cur.execute(
                     "ALTER TABLE memory_records ADD COLUMN last_decay_at REAL NOT NULL DEFAULT 0"
                 )
+            if "source_message_ids" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN source_message_ids TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "source_start_ts" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN source_start_ts REAL NOT NULL DEFAULT 0"
+                )
+            if "source_end_ts" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN source_end_ts REAL NOT NULL DEFAULT 0"
+                )
+            if "event_start_ts" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN event_start_ts REAL NOT NULL DEFAULT 0"
+                )
+            if "event_end_ts" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN event_end_ts REAL NOT NULL DEFAULT 0"
+                )
+            if "event_time_confidence" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN event_time_confidence TEXT NOT NULL DEFAULT 'low_confidence'"
+                )
                 
             # --- 第三批次新增：逻辑归档字段 ---
             if "is_archived" not in memory_column_names:
@@ -224,6 +273,18 @@ class MemorySqlManager:
                 """
                 CREATE INDEX IF NOT EXISTS idx_memory_tier_fields
                     ON memory_records(is_active, useful_score, last_recalled_at)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_scope_event_time
+                    ON memory_records(memory_scope, event_start_ts, event_end_ts)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_scope_source_time
+                    ON memory_records(memory_scope, source_start_ts, source_end_ts)
                 """
             )
             cur.execute(
@@ -581,6 +642,62 @@ class MemorySqlManager:
         normalized["end_ts"] = end_ts
         return normalized
 
+    @staticmethod
+    def _build_time_metadata(
+        time_metadata: Optional[Dict[str, Any]],
+        *,
+        created_at: float,
+        judgment: str = "",
+        reasoning: str = "",
+    ) -> Dict[str, Any]:
+        return apply_time_metadata_defaults(
+            time_metadata,
+            created_at=created_at,
+            text_for_inference="\n".join(
+                [str(judgment or "").strip(), str(reasoning or "").strip()]
+            ).strip(),
+        )
+
+    @staticmethod
+    def _select_memory_columns_sql() -> str:
+        return """
+            id, memory_type, judgment, reasoning, strength,
+            is_active, useful_count, useful_score, last_recalled_at,
+            memory_scope, created_at, source_message_ids,
+            source_start_ts, source_end_ts,
+            event_start_ts, event_end_ts, event_time_confidence
+        """
+
+    @classmethod
+    def _build_exact_time_window_sql(
+        cls,
+        alias: str,
+        normalized_time_filter: Dict[str, Any],
+    ) -> tuple[str, List[Any]]:
+        if not normalized_time_filter:
+            return "1 = 1", []
+        start_ts = float(normalized_time_filter["start_ts"])
+        end_ts = float(normalized_time_filter["end_ts"])
+        condition = f"""
+            (
+                (
+                    {alias}.event_start_ts > 0
+                    AND {alias}.event_end_ts >= {alias}.event_start_ts
+                    AND {alias}.event_end_ts >= ?
+                    AND {alias}.event_start_ts <= ?
+                )
+                OR
+                (
+                    ({alias}.event_start_ts <= 0 OR {alias}.event_end_ts < {alias}.event_start_ts)
+                    AND {alias}.source_start_ts > 0
+                    AND {alias}.source_end_ts >= {alias}.source_start_ts
+                    AND {alias}.source_end_ts >= ?
+                    AND {alias}.source_start_ts <= ?
+                )
+            )
+        """
+        return condition, [start_ts, end_ts, start_ts, end_ts]
+
     def _get_memories_in_time_window_sync(
         self,
         memory_scope: str,
@@ -591,15 +708,57 @@ class MemorySqlManager:
         if not normalized_time_filter:
             return []
         scope_cond, scope_params = self._scope_sql(memory_scope, "mr")
+        time_cond, time_params = self._build_exact_time_window_sql("mr", normalized_time_filter)
+        """
+            exact_payload = {
+                "query_preview": preview_text(text, 160),
+                "limit": int(limit),
+                "memory_scope": str(memory_scope or ""),
+                "has_vector_scores": bool(vector_scores),
+                "rerank_enabled": bool(self._hybrid_engine.has_rerank()),
+                "time_filter_supported": True,
+                "time_filter": normalized_time_filter,
+                "time_filter_note": "命中明确时间窗时，长期记忆优先按 event/source time 精确过滤；缺少事件时间的旧数据仅弱参与排序，不再把 created_at 当事件时间硬过滤。",
+                "time_filter_applied": True,
+                "event_time_filter_applied": True,
+                "source_time_filter_applied": True,
+                "created_at_filter_applied": False,
+                "current_long_term_time_field": "event/source time primary",
+                "window_candidate_count": len(exact_candidate_memories),
+                "fallback_candidate_count": len(fallback_memories),
+                "result_summary": summarize_memory_records(ordered),
+                "result_summary_by_event_time": summarize_memories_by_time_field(
+                    ordered, field="event"
+                ),
+                "result_summary_by_created_at": summarize_memories_by_time_field(
+                    ordered, field="created_at"
+                ),
+                "time_field_usage": build_result_time_usage(
+                    ordered, normalized_time_filter
+                ),
+            }
+            self.logger.info(
+                f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(exact_payload, ensure_ascii=False)}"
+            )
+            return ordered
+        """
+        if not normalized_time_filter:
+            return []
+        scope_cond, scope_params = self._scope_sql(memory_scope, "mr")
+        time_cond, time_params = self._build_exact_time_window_sql("mr", normalized_time_filter)
         sql = f"""
-            SELECT id, memory_type, judgment, reasoning, strength,
-                   is_active, useful_count, useful_score, last_recalled_at,
-                   memory_scope, created_at
+            SELECT {self._select_memory_columns_sql()}
             FROM memory_records mr
             WHERE {scope_cond}
-              AND mr.created_at >= ?
-              AND mr.created_at <= ?
-            ORDER BY mr.created_at DESC
+              AND mr.is_archived = 0
+              AND {time_cond}
+            ORDER BY
+                CASE
+                    WHEN mr.event_end_ts > 0 THEN mr.event_end_ts
+                    WHEN mr.source_end_ts > 0 THEN mr.source_end_ts
+                    ELSE mr.created_at
+                END DESC,
+                mr.created_at DESC
             LIMIT ?
         """
         with self._connect() as conn:
@@ -607,8 +766,7 @@ class MemorySqlManager:
                 sql,
                 (
                     *scope_params,
-                    float(normalized_time_filter["start_ts"]),
-                    float(normalized_time_filter["end_ts"]),
+                    *time_params,
                     max(1, int(limit)),
                 ),
             ).fetchall()
@@ -681,13 +839,10 @@ class MemorySqlManager:
         end_ts = float(normalized_time_filter["end_ts"])
         if end_ts <= start_ts:
             return 0.0
-        try:
-            created_at = float(getattr(memory, "created_at", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            created_at = 0.0
-        if created_at <= 0:
+        timestamp = primary_timestamp(memory)
+        if timestamp <= 0:
             return 0.0
-        return max(0.0, min(1.0, (created_at - start_ts) / (end_ts - start_ts)))
+        return max(0.0, min(1.0, (timestamp - start_ts) / (end_ts - start_ts)))
 
     @staticmethod
     def _row_to_memory(row: sqlite3.Row, tags: List[str]) -> BaseMemory:
@@ -711,6 +866,14 @@ class MemorySqlManager:
             useful_count=int(_v("useful_count", 0) or 0),
             useful_score=float(_v("useful_score", 0.0) or 0.0),
             last_recalled_at=float(_v("last_recalled_at", 0.0) or 0.0),
+            source_message_ids=normalize_source_message_ids(_v("source_message_ids", "[]")),
+            source_start_ts=float(_v("source_start_ts", 0.0) or 0.0),
+            source_end_ts=float(_v("source_end_ts", 0.0) or 0.0),
+            event_start_ts=float(_v("event_start_ts", 0.0) or 0.0),
+            event_end_ts=float(_v("event_end_ts", 0.0) or 0.0),
+            event_time_confidence=str(
+                _v("event_time_confidence", TIME_CONFIDENCE_LOW) or TIME_CONFIDENCE_LOW
+            ),
         )
 
     def _fetch_tags_for_memory_ids(
@@ -1052,8 +1215,8 @@ class MemorySqlManager:
         doc_text_map = self._build_memory_doc_text_map_by_ids(ordered_ids)
         query_terms = self._extract_search_terms(query)
         rerank_map: Dict[str, float] = {}
-        created_at_map = {
-            str(getattr(memory, "id", "") or "").strip(): float(getattr(memory, "created_at", 0.0) or 0.0)
+        timestamp_map = {
+            str(getattr(memory, "id", "") or "").strip(): float(primary_timestamp(memory) or 0.0)
             for memory in candidate_memories
             if str(getattr(memory, "id", "") or "").strip()
         }
@@ -1067,19 +1230,26 @@ class MemorySqlManager:
             lexical_score = self._text_overlap_score(query_terms, doc_text)
             vector_score = float((vector_scores or {}).get(memory_id, 0.0) or 0.0)
             recency_score = self._recency_score(memory, time_filter)
+            time_match_boost = time_sort_boost(memory, time_filter)
             if query_terms:
                 base_scores[memory_id] = max(
-                    (0.45 * vector_score) + (0.35 * lexical_score) + (0.20 * recency_score),
+                    (0.40 * vector_score)
+                    + (0.25 * lexical_score)
+                    + (0.20 * recency_score)
+                    + (0.15 * time_match_boost),
                     lexical_score,
                     vector_score,
                 )
             else:
-                base_scores[memory_id] = max((0.80 * recency_score) + (0.20 * vector_score), recency_score)
+                base_scores[memory_id] = max(
+                    (0.55 * recency_score) + (0.25 * time_match_boost) + (0.20 * vector_score),
+                    recency_score,
+                )
 
         ordered_ids.sort(
             key=lambda memory_id: (
                 float(base_scores.get(memory_id, 0.0)),
-                float(created_at_map.get(memory_id, 0.0) or 0.0),
+                float(timestamp_map.get(memory_id, 0.0) or 0.0),
             ),
             reverse=True,
         )
@@ -1105,6 +1275,7 @@ class MemorySqlManager:
             lexical_score = self._text_overlap_score(query_terms, doc_text)
             vector_score = float((vector_scores or {}).get(memory_id, 0.0) or 0.0)
             recency_score = self._recency_score(memory, time_filter)
+            time_match_boost = time_sort_boost(memory, time_filter)
             rerank_score = float(rerank_map.get(memory_id, 0.0) or 0.0)
 
             if query_terms and rerank_score <= 0 and lexical_score <= 0 and vector_score < 0.45:
@@ -1112,17 +1283,26 @@ class MemorySqlManager:
 
             if rerank_map:
                 final_score = max(
-                    (0.55 * rerank_score) + (0.25 * max(vector_score, lexical_score)) + (0.20 * recency_score),
+                    (0.50 * rerank_score)
+                    + (0.20 * max(vector_score, lexical_score))
+                    + (0.15 * recency_score)
+                    + (0.15 * time_match_boost),
                     rerank_score,
                 )
             elif query_terms:
                 final_score = max(
-                    (0.45 * vector_score) + (0.35 * lexical_score) + (0.20 * recency_score),
+                    (0.40 * vector_score)
+                    + (0.25 * lexical_score)
+                    + (0.20 * recency_score)
+                    + (0.15 * time_match_boost),
                     lexical_score,
                     vector_score,
                 )
             else:
-                final_score = max((0.80 * recency_score) + (0.20 * vector_score), recency_score)
+                final_score = max(
+                    (0.55 * recency_score) + (0.25 * time_match_boost) + (0.20 * vector_score),
+                    recency_score,
+                )
 
             memory.similarity = float(final_score)
             ranked.append(memory)
@@ -1130,7 +1310,8 @@ class MemorySqlManager:
         ranked.sort(
             key=lambda mem: (
                 float(getattr(mem, "similarity", 0.0) or 0.0),
-                float(getattr(mem, "created_at", 0.0) or 0.0),
+                float(time_sort_boost(mem, time_filter)),
+                float(primary_timestamp(mem) or 0.0),
             ),
             reverse=True,
         )
@@ -1378,6 +1559,7 @@ class MemorySqlManager:
         is_active: bool = False,
         strength: Optional[int] = None,
         memory_scope: str = "public",
+        time_metadata: Optional[Dict[str, Any]] = None,
     ) -> BaseMemory:
         return await asyncio.to_thread(
             self._remember_sync,
@@ -1388,6 +1570,7 @@ class MemorySqlManager:
             is_active,
             strength,
             memory_scope,
+            time_metadata,
         )
 
     async def upsert_memory(self, memory: BaseMemory) -> BaseMemory:
@@ -1405,10 +1588,17 @@ class MemorySqlManager:
         is_active: bool = False,
         strength: Optional[int] = None,
         memory_scope: str = "public",
+        time_metadata: Optional[Dict[str, Any]] = None,
     ) -> BaseMemory:
         scope = self._normalize_scope(memory_scope)
         normalized_tags = self._normalize_tags(tags)
         now = time.time()
+        resolved_time_metadata = self._build_time_metadata(
+            time_metadata,
+            created_at=now,
+            judgment=str(judgment or "").strip(),
+            reasoning=str(reasoning or "").strip(),
+        )
         memory = BaseMemory(
             memory_type=self._to_memory_type(memory_type),
             judgment=str(judgment or "").strip(),
@@ -1426,6 +1616,15 @@ class MemorySqlManager:
             useful_count=0,
             useful_score=0.0,
             last_recalled_at=0.0,
+            source_message_ids=resolved_time_metadata.get("source_message_ids", []),
+            source_start_ts=resolved_time_metadata.get("source_start_ts", 0.0),
+            source_end_ts=resolved_time_metadata.get("source_end_ts", 0.0),
+            event_start_ts=resolved_time_metadata.get("event_start_ts", 0.0),
+            event_end_ts=resolved_time_metadata.get("event_end_ts", 0.0),
+            event_time_confidence=resolved_time_metadata.get(
+                "event_time_confidence",
+                TIME_CONFIDENCE_LOW,
+            ),
         )
 
         with self._connect() as conn:
@@ -1434,8 +1633,10 @@ class MemorySqlManager:
                 INSERT INTO memory_records(
                     id, memory_type, judgment, reasoning, strength, is_active,
                     useful_count, useful_score, last_recalled_at,
-                    memory_scope, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                    event_start_ts, event_end_ts, event_time_confidence,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory.id,
@@ -1448,6 +1649,12 @@ class MemorySqlManager:
                     memory.useful_score,
                     memory.last_recalled_at,
                     scope,
+                    json.dumps(memory.source_message_ids, ensure_ascii=False),
+                    memory.source_start_ts,
+                    memory.source_end_ts,
+                    memory.event_start_ts,
+                    memory.event_end_ts,
+                    memory.event_time_confidence,
                     memory.created_at,
                     now,
                 ),
@@ -1464,6 +1671,19 @@ class MemorySqlManager:
         now = time.time()
         memory_id = str(getattr(memory, "id", "") or uuid.uuid4())
         created_at = float(getattr(memory, "created_at", now) or now)
+        resolved_time_metadata = self._build_time_metadata(
+            {
+                "source_message_ids": getattr(memory, "source_message_ids", []),
+                "source_start_ts": getattr(memory, "source_start_ts", 0.0),
+                "source_end_ts": getattr(memory, "source_end_ts", 0.0),
+                "event_start_ts": getattr(memory, "event_start_ts", 0.0),
+                "event_end_ts": getattr(memory, "event_end_ts", 0.0),
+                "event_time_confidence": getattr(memory, "event_time_confidence", TIME_CONFIDENCE_LOW),
+            },
+            created_at=created_at,
+            judgment=str(getattr(memory, "judgment", "") or "").strip(),
+            reasoning=str(getattr(memory, "reasoning", "") or "").strip(),
+        )
         memory_type = getattr(getattr(memory, "memory_type", None), "value", None)
         if not memory_type:
             memory_type = "知识记忆"
@@ -1474,8 +1694,10 @@ class MemorySqlManager:
                 INSERT INTO memory_records(
                     id, memory_type, judgment, reasoning, strength, is_active,
                     useful_count, useful_score, last_recalled_at,
-                    memory_scope, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                    event_start_ts, event_end_ts, event_time_confidence,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     memory_type=excluded.memory_type,
                     judgment=excluded.judgment,
@@ -1486,6 +1708,12 @@ class MemorySqlManager:
                     useful_score=excluded.useful_score,
                     last_recalled_at=excluded.last_recalled_at,
                     memory_scope=excluded.memory_scope,
+                    source_message_ids=excluded.source_message_ids,
+                    source_start_ts=excluded.source_start_ts,
+                    source_end_ts=excluded.source_end_ts,
+                    event_start_ts=excluded.event_start_ts,
+                    event_end_ts=excluded.event_end_ts,
+                    event_time_confidence=excluded.event_time_confidence,
                     created_at=excluded.created_at,
                     updated_at=excluded.updated_at
                 """,
@@ -1500,6 +1728,20 @@ class MemorySqlManager:
                     float(getattr(memory, "useful_score", 0.0) or 0.0),
                     float(getattr(memory, "last_recalled_at", 0.0) or 0.0),
                     scope,
+                    json.dumps(
+                        normalize_source_message_ids(
+                            resolved_time_metadata.get("source_message_ids", [])
+                        ),
+                        ensure_ascii=False,
+                    ),
+                    float(resolved_time_metadata.get("source_start_ts", 0.0) or 0.0),
+                    float(resolved_time_metadata.get("source_end_ts", 0.0) or 0.0),
+                    float(resolved_time_metadata.get("event_start_ts", 0.0) or 0.0),
+                    float(resolved_time_metadata.get("event_end_ts", 0.0) or 0.0),
+                    str(
+                        resolved_time_metadata.get("event_time_confidence", TIME_CONFIDENCE_LOW)
+                        or TIME_CONFIDENCE_LOW
+                    ),
                     created_at,
                     now,
                 ),
@@ -1561,6 +1803,12 @@ class MemorySqlManager:
                     useful_score = float(raw.get("useful_score", 0.0) or 0.0)
                     last_recalled_at = float(raw.get("last_recalled_at", 0.0) or 0.0)
                     memory_scope = self._normalize_scope(raw.get("memory_scope", "public"))
+                    resolved_time_metadata = self._build_time_metadata(
+                        raw,
+                        created_at=created_at,
+                        judgment=judgment,
+                        reasoning=reasoning,
+                    )
 
                     existing_rows = conn.execute(
                         """
@@ -1587,6 +1835,12 @@ class MemorySqlManager:
                                     useful_score = ?,
                                     last_recalled_at = ?,
                                     memory_scope = ?,
+                                    source_message_ids = ?,
+                                    source_start_ts = ?,
+                                    source_end_ts = ?,
+                                    event_start_ts = ?,
+                                    event_end_ts = ?,
+                                    event_time_confidence = ?,
                                     created_at = ?,
                                     updated_at = ?
                                 WHERE id = ?
@@ -1600,6 +1854,23 @@ class MemorySqlManager:
                                     useful_score,
                                     last_recalled_at,
                                     memory_scope,
+                                    json.dumps(
+                                        normalize_source_message_ids(
+                                            resolved_time_metadata.get("source_message_ids", [])
+                                        ),
+                                        ensure_ascii=False,
+                                    ),
+                                    float(resolved_time_metadata.get("source_start_ts", 0.0) or 0.0),
+                                    float(resolved_time_metadata.get("source_end_ts", 0.0) or 0.0),
+                                    float(resolved_time_metadata.get("event_start_ts", 0.0) or 0.0),
+                                    float(resolved_time_metadata.get("event_end_ts", 0.0) or 0.0),
+                                    str(
+                                        resolved_time_metadata.get(
+                                            "event_time_confidence",
+                                            TIME_CONFIDENCE_LOW,
+                                        )
+                                        or TIME_CONFIDENCE_LOW
+                                    ),
                                     created_at,
                                     now,
                                     keep_id,
@@ -1629,8 +1900,10 @@ class MemorySqlManager:
                             INSERT INTO memory_records(
                                 id, memory_type, judgment, reasoning, strength, is_active,
                                 useful_count, useful_score, last_recalled_at,
-                                memory_scope, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                                event_start_ts, event_end_ts, event_time_confidence,
+                                created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 memory_id,
@@ -1643,6 +1916,23 @@ class MemorySqlManager:
                                 useful_score,
                                 last_recalled_at,
                                 memory_scope,
+                                json.dumps(
+                                    normalize_source_message_ids(
+                                        resolved_time_metadata.get("source_message_ids", [])
+                                    ),
+                                    ensure_ascii=False,
+                                ),
+                                float(resolved_time_metadata.get("source_start_ts", 0.0) or 0.0),
+                                float(resolved_time_metadata.get("source_end_ts", 0.0) or 0.0),
+                                float(resolved_time_metadata.get("event_start_ts", 0.0) or 0.0),
+                                float(resolved_time_metadata.get("event_end_ts", 0.0) or 0.0),
+                                str(
+                                    resolved_time_metadata.get(
+                                        "event_time_confidence",
+                                        TIME_CONFIDENCE_LOW,
+                                    )
+                                    or TIME_CONFIDENCE_LOW
+                                ),
                                 created_at,
                                 now,
                             ),
@@ -1819,6 +2109,123 @@ class MemorySqlManager:
             return []
 
         normalized_time_filter = self._normalize_time_filter(time_filter)
+        if normalized_time_filter:
+            exact_candidate_memories = await asyncio.to_thread(
+                self._get_memories_in_time_window_sync,
+                memory_scope,
+                normalized_time_filter,
+                max(200, int(limit) * 40),
+            )
+            ordered_exact = await self._rank_time_window_memories(
+                query=text,
+                candidate_memories=exact_candidate_memories,
+                limit=limit,
+                vector_scores=vector_scores,
+                time_filter=normalized_time_filter,
+            )
+            fallback_memories: List[BaseMemory] = []
+
+            if len(ordered_exact) < int(limit):
+                self._ensure_fts_ready_sync()
+                candidate_limit = max(20, int(limit) * 12)
+                bm25_limit = max(50, int(limit) * 20)
+                fallback_hits = await self._hybrid_engine.search_with_strategy(
+                    query=text,
+                    limit=candidate_limit,
+                    candidate_limit=candidate_limit,
+                    bm25_limit=bm25_limit,
+                    vector_scores=vector_scores,
+                    bm25_only_search=lambda q, k: self._fts_retriever.search_memory_bm25_only(query=q, limit=k),
+                    fusion_search=lambda q, k, bk, scores: self._fts_retriever.search_memory(
+                        query=q,
+                        limit=k,
+                        fts_limit=bk,
+                        fts_weight=0.3,
+                        vector_weight=0.7,
+                        vector_scores=scores,
+                        min_final_score=0.0,
+                    ),
+                    build_doc_text_map=self._build_memory_doc_text_map_by_ids,
+                )
+                fallback_ids = [
+                    str(item.get("id") or "").strip()
+                    for item in fallback_hits
+                    if str(item.get("id") or "").strip()
+                ]
+                fallback_score_map = {
+                    str(item.get("id") or "").strip(): float(item.get("final_score", 0.0) or 0.0)
+                    for item in fallback_hits
+                    if str(item.get("id") or "").strip()
+                }
+                fallback_memory_map = {
+                    mem.id: mem for mem in self._get_memories_by_ids_sync(fallback_ids)
+                }
+                exact_ids = {str(mem.id) for mem in exact_candidate_memories}
+                seen_fallback_ids = set()
+                for memory_id in fallback_ids:
+                    if not memory_id or memory_id in exact_ids or memory_id in seen_fallback_ids:
+                        continue
+                    mem = fallback_memory_map.get(memory_id)
+                    if mem is None:
+                        continue
+                    if not self._is_scope_allowed(
+                        getattr(mem, "memory_scope", "public"), memory_scope
+                    ):
+                        continue
+                    match = classify_memory_time_match(mem, normalized_time_filter)
+                    if str(match.get("match_type", "")) not in {"created_at_only", "none"}:
+                        continue
+                    base_score = float(fallback_score_map.get(memory_id, 0.0) or 0.0)
+                    mem.similarity = (base_score * 0.35) + (
+                        time_sort_boost(mem, normalized_time_filter) * 0.15
+                    )
+                    fallback_memories.append(mem)
+                    seen_fallback_ids.add(memory_id)
+
+                fallback_memories.sort(
+                    key=lambda mem: (
+                        float(getattr(mem, "similarity", 0.0) or 0.0),
+                        float(time_sort_boost(mem, normalized_time_filter)),
+                        float(primary_timestamp(mem) or 0.0),
+                    ),
+                    reverse=True,
+                )
+
+            ordered = list(ordered_exact)
+            if len(ordered) < int(limit):
+                ordered.extend(fallback_memories[: max(0, int(limit) - len(ordered))])
+
+            exact_payload = {
+                "query_preview": preview_text(text, 160),
+                "limit": int(limit),
+                "memory_scope": str(memory_scope or ""),
+                "has_vector_scores": bool(vector_scores),
+                "rerank_enabled": bool(self._hybrid_engine.has_rerank()),
+                "time_filter_supported": True,
+                "time_filter": normalized_time_filter,
+                "time_filter_note": "命中明确时间窗时，长期记忆优先按 event/source time 精确过滤；缺少事件时间的旧数据仅弱参与排序，不再把 created_at 当事件时间硬过滤。",
+                "time_filter_applied": True,
+                "event_time_filter_applied": True,
+                "source_time_filter_applied": True,
+                "created_at_filter_applied": False,
+                "current_long_term_time_field": "event/source time primary",
+                "window_candidate_count": len(exact_candidate_memories),
+                "fallback_candidate_count": len(fallback_memories),
+                "result_summary": summarize_memory_records(ordered),
+                "result_summary_by_event_time": summarize_memories_by_time_field(
+                    ordered, field="event"
+                ),
+                "result_summary_by_created_at": summarize_memories_by_time_field(
+                    ordered, field="created_at"
+                ),
+                "time_field_usage": build_result_time_usage(
+                    ordered, normalized_time_filter
+                ),
+            }
+            self.logger.info(
+                f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(exact_payload, ensure_ascii=False)}"
+            )
+            return ordered
 
         payload = {
             'query_preview': preview_text(text, 160),
@@ -2094,9 +2501,7 @@ class MemorySqlManager:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, memory_type, judgment, reasoning, strength,
-                       is_active, useful_count, useful_score, last_recalled_at,
-                       memory_scope, created_at
+                SELECT {self._select_memory_columns_sql()}
                 FROM memory_records
                 WHERE id IN ({placeholders}) AND is_archived = 0
                 """,
@@ -2130,6 +2535,49 @@ class MemorySqlManager:
         merged_useful_count = sum(int(getattr(mem, "useful_count", 0) or 0) for mem in memories)
         merged_useful_score = max(float(getattr(mem, "useful_score", 0.0) or 0.0) for mem in memories)
         merged_last_recalled_at = max(float(getattr(mem, "last_recalled_at", 0.0) or 0.0) for mem in memories)
+        merged_source_message_ids = normalize_source_message_ids(
+            [
+                source_id
+                for mem in memories
+                for source_id in (getattr(mem, "source_message_ids", []) or [])
+            ]
+        )
+        merged_source_start_values = [
+            safe_float(getattr(mem, "source_start_ts", 0.0))
+            for mem in memories
+            if safe_float(getattr(mem, "source_start_ts", 0.0)) > 0
+        ]
+        merged_source_end_values = [
+            safe_float(getattr(mem, "source_end_ts", 0.0))
+            for mem in memories
+            if safe_float(getattr(mem, "source_end_ts", 0.0)) > 0
+        ]
+        merged_event_start_values = [
+            safe_float(getattr(mem, "event_start_ts", 0.0))
+            for mem in memories
+            if safe_float(getattr(mem, "event_start_ts", 0.0)) > 0
+        ]
+        merged_event_end_values = [
+            safe_float(getattr(mem, "event_end_ts", 0.0))
+            for mem in memories
+            if safe_float(getattr(mem, "event_end_ts", 0.0)) > 0
+        ]
+        merged_source_start_ts = min(merged_source_start_values) if merged_source_start_values else 0.0
+        merged_source_end_ts = max(merged_source_end_values) if merged_source_end_values else 0.0
+        merged_event_start_ts = min(merged_event_start_values) if merged_event_start_values else merged_source_start_ts
+        merged_event_end_ts = max(merged_event_end_values) if merged_event_end_values else merged_source_end_ts
+        confidence_values = {
+            str(getattr(mem, "event_time_confidence", "") or "").strip().lower()
+            for mem in memories
+        }
+        merged_event_confidence = TIME_CONFIDENCE_LOW
+        if merged_event_start_ts > 0 and merged_event_end_ts >= merged_event_start_ts:
+            if TIME_CONFIDENCE_EXACT in confidence_values:
+                merged_event_confidence = TIME_CONFIDENCE_EXACT
+            elif TIME_CONFIDENCE_INFERRED in confidence_values:
+                merged_event_confidence = TIME_CONFIDENCE_INFERRED
+            elif merged_source_start_ts > 0:
+                merged_event_confidence = TIME_CONFIDENCE_EXACT
         now = time.time()
         new_memory = BaseMemory(
             memory_type=self._to_memory_type("knowledge"),
@@ -2144,6 +2592,12 @@ class MemorySqlManager:
             useful_count=merged_useful_count,
             useful_score=merged_useful_score,
             last_recalled_at=merged_last_recalled_at,
+            source_message_ids=merged_source_message_ids,
+            source_start_ts=merged_source_start_ts,
+            source_end_ts=merged_source_end_ts,
+            event_start_ts=merged_event_start_ts,
+            event_end_ts=merged_event_end_ts,
+            event_time_confidence=merged_event_confidence,
         )
 
         ids = [mem.id for mem in memories]
@@ -2157,8 +2611,10 @@ class MemorySqlManager:
                     INSERT INTO memory_records(
                         id, memory_type, judgment, reasoning, strength, is_active,
                         useful_count, useful_score, last_recalled_at,
-                        memory_scope, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                        event_start_ts, event_end_ts, event_time_confidence,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_memory.id,
@@ -2171,6 +2627,12 @@ class MemorySqlManager:
                         new_memory.useful_score,
                         new_memory.last_recalled_at,
                         new_memory.memory_scope,
+                        json.dumps(new_memory.source_message_ids, ensure_ascii=False),
+                        new_memory.source_start_ts,
+                        new_memory.source_end_ts,
+                        new_memory.event_start_ts,
+                        new_memory.event_end_ts,
+                        new_memory.event_time_confidence,
                         new_memory.created_at,
                         now,
                     ),
@@ -2226,6 +2688,7 @@ class MemorySqlManager:
                 judgment=judgment,
                 reasoning=reasoning,
                 tags=mem_data.get("tags") or [],
+                time_metadata=mem_data,
                 is_active=bool(mem_data.get("is_active", False)),
                 strength=mem_data.get("strength"),
                 memory_scope=resolved_scope,
@@ -2354,21 +2817,31 @@ class MemorySqlManager:
             return []
 
         scope_cond, scope_params = self._scope_sql(memory_scope, "mr")
+        normalized_time_filter = {
+            "matched": True,
+            "start_ts": float(start_ts),
+            "end_ts": float(end_ts),
+        }
+        time_cond, time_params = self._build_exact_time_window_sql("mr", normalized_time_filter)
         
         # 硬性时间范围查询，忽略 is_archived = 1 使得即使衰减的旧事也能按时间捞回
         # llm_memory/components/memory_sql_manager.py 第 998 行为：
         sql = f"""
-            SELECT id, memory_type, judgment, reasoning, strength,
-                   is_active, useful_count, useful_score, last_recalled_at,
-                   memory_scope, created_at
+            SELECT {self._select_memory_columns_sql()}
             FROM memory_records mr
-            WHERE created_at >= ? AND created_at <= ?
-              AND {scope_cond}
-            ORDER BY created_at DESC
+            WHERE {scope_cond}
+              AND {time_cond}
+            ORDER BY
+                CASE
+                    WHEN mr.event_end_ts > 0 THEN mr.event_end_ts
+                    WHEN mr.source_end_ts > 0 THEN mr.source_end_ts
+                    ELSE mr.created_at
+                END DESC,
+                mr.created_at DESC
         """
 # 注意：删除了原有的 is_archived = 0 条件
         with self._connect() as conn:
-            rows = conn.execute(sql, (start_ts, end_ts, *scope_params)).fetchall()
+            rows = conn.execute(sql, (*scope_params, *time_params)).fetchall()
             tags_map = self._fetch_tags_for_memory_ids(conn, [str(row["id"]) for row in rows])
             
         memories = [
@@ -2379,7 +2852,14 @@ class MemorySqlManager:
             'memory_scope': str(memory_scope or ''),
             'start_ts': float(start_ts),
             'end_ts': float(end_ts),
+            'event_time_filter_applied': True,
+            'source_time_filter_applied': True,
+            'created_at_filter_applied': False,
+            'current_long_term_time_field': 'event/source time primary',
             'result_summary': summarize_memory_records(memories),
+            'result_summary_by_event_time': summarize_memories_by_time_field(memories, field='event'),
+            'result_summary_by_created_at': summarize_memories_by_time_field(memories, field='created_at'),
+            'time_field_usage': build_result_time_usage(memories, normalized_time_filter),
         }
         self.logger.info(
             f"[时间过滤诊断][按时间硬过滤结果] payload={json.dumps(payload, ensure_ascii=False)}"

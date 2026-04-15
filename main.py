@@ -62,7 +62,7 @@ def configure_logging_behavior():
     "astrbot_plugin_angel_memory",
     "kawayiYokami",
     "天使的记忆，让astrbot拥有记忆维护系统和开箱即用的知识库检索",
-    "1.3.12",
+    "1.4.2",
     "https://github.com/kawayiYokami/astrbot_plugin_angel_memory"
 )
 class AngelMemoryPlugin(Star):
@@ -418,8 +418,14 @@ class AngelMemoryPlugin(Star):
         time_filter = build_time_filter_payload(time_intent)
         recall_request = analyze_recall_request(message_text)
         matched_phrases = list(recall_request.get("matched_phrases", []) or [])
+        explicit_time_window = bool(
+            time_filter.get("matched") and time_filter.get("has_explicit_window")
+        )
         exact_raw_chat_only = bool(
-            recall_request.get("raw_chat_priority")
+            (
+                recall_request.get("raw_chat_priority")
+                or time_intent.intent_type in {"刚才", "前面", "之前", "上次"}
+            )
             and (
                 time_intent.intent_type in {"刚才", "前面"}
                 or any(
@@ -428,7 +434,24 @@ class AngelMemoryPlugin(Star):
                 )
             )
         )
-        strict_time_recall = bool(time_filter.get("matched") and recall_request.get("matched"))
+        strict_time_recall = explicit_time_window
+        diagnostic_store = get_event_diagnostic_store(event)
+        diagnostic_store["time_intent"] = time_intent.to_dict()
+        diagnostic_store["recall_request"] = recall_request
+        diagnostic_store["time_filter"] = time_filter
+        diagnostic_store["raw_chat_time_recall_gate"] = {
+            "raw_user_input": preview_text(message_text, 160),
+            "time_intent": time_intent.to_dict(),
+            "time_filter": time_filter,
+            "recall_request": recall_request,
+            "strict_time_recall": strict_time_recall,
+            "exact_raw_chat_only": exact_raw_chat_only,
+            "gate_note": "明确时间窗优先于 recall phrase，recall phrase 仅作增强信号。",
+        }
+        self.logger.info(
+            "[时间过滤诊断][原始聊天门控] payload="
+            f"{json.dumps(diagnostic_store['raw_chat_time_recall_gate'], ensure_ascii=False)}"
+        )
 
         try:
             raw_chat_recall_rows: list[tuple[str, str, float]] = []
@@ -452,6 +475,16 @@ class AngelMemoryPlugin(Star):
                 )
 
             if not raw_chat_recall_rows and time_intent.intent_type in {"刚才", "前面"}:
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+
+            if not raw_chat_recall_rows and time_intent.intent_type in {"刚才", "前面", "之前", "上次"}:
                 raw_chat_recall_rows = await asyncio.to_thread(
                     self._fetch_raw_chat_records,
                     session_id,
@@ -574,6 +607,9 @@ class AngelMemoryPlugin(Star):
             else:
                 self.logger.info("ℹ️ 未检测到可用提供商，将使用本地模式")
 
+            provider_configured = bool(embedding_provider_id or llm_provider_id)
+            if provider_configured and not self.plugin_context.has_providers():
+                self.logger.info("ℹ️ 提供商配置已读取，但当前启动阶段注册表可能尚未就绪")
         except (AttributeError, KeyError, TypeError) as e:
             self.logger.error(f"❌ 配置检查失败: {e}")
 

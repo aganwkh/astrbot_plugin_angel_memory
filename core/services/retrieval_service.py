@@ -61,6 +61,15 @@ class DeepMindRetrievalService:
         strict_time_recall = bool(recall_policy.get("strict_time_recall")) if isinstance(recall_policy, dict) else False
         prefer_raw_chat_only = bool(recall_policy.get("prefer_raw_chat_only")) if isinstance(recall_policy, dict) else False
         skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
+        requested_note_time_filter = time_filter if strict_time_recall else {}
+        note_time_filter_capability = {
+            "supported": False,
+            "requested": bool(requested_note_time_filter),
+            "requested_time_filter": requested_note_time_filter,
+            "applied": False,
+            "note": "note 检索链当前不支持 time_filter，不能把 note 结果视为时间过滤后的结果。",
+        }
+        retrieval_diagnostic["note_time_filter_capability"] = note_time_filter_capability
 
         if precompute_vectors:
             memory_query, memory_vector = (
@@ -195,11 +204,23 @@ class DeepMindRetrievalService:
                 "recall_request": recall_request,
                 "time_filter_passed": bool(time_filter.get("matched") and strict_time_recall),
                 "time_filter": time_filter if strict_time_recall else {},
+                "time_filter_supported": False,
+                "time_filter_requested": bool(requested_note_time_filter),
+                "time_filter_requested_but_unsupported": bool(requested_note_time_filter),
+                "time_filter_status_note": "note 检索链当前不支持 time_filter；即使本轮存在时间窗，note 结果也未按时间过滤。",
+                "time_filter_note": "note 检索链当前不支持 time_filter；本轮因时间回顾优先策略直接跳过 note 检索。",
                 "skipped": True,
                 "skip_reason": "时间窗回顾问题优先避免笔记混入。",
             }
             retrieval_diagnostic["note_call"] = note_call_payload
-            retrieval_diagnostic["note_result"] = summarize_note_records([])
+            retrieval_diagnostic["note_result"] = {
+                "summary": summarize_note_records([]),
+                "time_filter_supported": False,
+                "time_filter_requested": bool(requested_note_time_filter),
+                "time_filter_requested_but_unsupported": bool(requested_note_time_filter),
+                "time_filter_applied": False,
+                "note": "note 检索链当前不支持 time_filter，且本轮已被跳过。",
+            }
             deepmind.logger.info(
                 "[时间过滤诊断][笔记检索入参] payload="
                 f"{json.dumps(note_call_payload, ensure_ascii=False)}"
@@ -214,7 +235,10 @@ class DeepMindRetrievalService:
                 "time_intent": time_intent,
                 "recall_request": recall_request,
                 "time_filter_passed": False,
-                "time_filter": {},
+                "time_filter": requested_note_time_filter,
+                "time_filter_supported": False,
+                "time_filter_requested": bool(requested_note_time_filter),
+                "time_filter_requested_but_unsupported": bool(requested_note_time_filter),
                 "time_filter_note": "时间回顾问题默认跳过笔记；普通问题保持原有笔记检索。",
             }
             retrieval_diagnostic["note_call"] = note_call_payload
@@ -228,9 +252,17 @@ class DeepMindRetrievalService:
                 recall_count=deepmind.note_candidate_top_k,
                 top_k=deepmind.note_candidate_top_k,
                 vector=note_vector,
+                time_filter=requested_note_time_filter or None,
             )
 
-            note_result_payload = summarize_note_records(candidate_notes)
+            note_result_payload = {
+                "summary": summarize_note_records(candidate_notes),
+                "time_filter_supported": False,
+                "time_filter_requested": bool(requested_note_time_filter),
+                "time_filter_requested_but_unsupported": bool(requested_note_time_filter),
+                "time_filter_applied": False,
+                "note": "note 检索结果未应用 time_filter，请勿把它视为按时间窗过滤后的候选。",
+            }
             retrieval_diagnostic["note_result"] = note_result_payload
             deepmind.logger.info(
                 "[时间过滤诊断][笔记检索结果] payload="

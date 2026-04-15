@@ -23,6 +23,13 @@ from .memory_decay_policy import MemoryDecayConfig, MemoryDecayPolicy
 # 导入查询处理器（用于统一检索词预处理）
 from ...core.utils.query_processor import get_query_processor
 from ...core.utils.time_diagnostics import preview_text, summarize_memory_records
+from ...core.utils.memory_time import (
+    build_result_time_usage,
+    classify_memory_time_match,
+    primary_timestamp,
+    summarize_memories_by_time_field,
+    time_sort_boost,
+)
 
 
 class MemoryManager:
@@ -195,13 +202,7 @@ class MemoryManager:
         normalized_time_filter = cls._normalize_time_filter(time_filter)
         if not normalized_time_filter:
             return scope_filter
-        return {
-            "$and": [
-                scope_filter,
-                {"created_at": {"$gte": float(normalized_time_filter["start_ts"])}},
-                {"created_at": {"$lte": float(normalized_time_filter["end_ts"])}},
-            ]
-        }
+        return scope_filter
 
     @classmethod
     def _matches_time_filter(
@@ -210,14 +211,12 @@ class MemoryManager:
         normalized_time_filter = cls._normalize_time_filter(time_filter)
         if not normalized_time_filter:
             return True
-        try:
-            created_at = float(getattr(memory, "created_at", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            created_at = 0.0
-        return (
-            created_at >= float(normalized_time_filter["start_ts"])
-            and created_at <= float(normalized_time_filter["end_ts"])
-        )
+        match = classify_memory_time_match(memory, normalized_time_filter)
+        return str(match.get("match_type", "")) in {
+            "event_exact",
+            "event_inferred",
+            "source_exact",
+        }
 
     async def comprehensive_recall(
         self,
@@ -290,6 +289,13 @@ class MemoryManager:
                     'mode': 'hybrid_sql',
                     'time_filter_applied': bool(normalized_time_filter),
                     'result_summary': summarize_memory_records(hybrid_memories[:limit]),
+                    'event_time_filter_applied': bool(normalized_time_filter),
+                    'source_time_filter_applied': bool(normalized_time_filter),
+                    'created_at_filter_applied': False,
+                    'current_long_term_time_field': 'event/source time primary' if normalized_time_filter else 'semantic_only',
+                    'result_summary_by_event_time': summarize_memories_by_time_field(hybrid_memories[:limit], field='event'),
+                    'result_summary_by_created_at': summarize_memories_by_time_field(hybrid_memories[:limit], field='created_at'),
+                    'time_field_usage': build_result_time_usage(hybrid_memories[:limit], normalized_time_filter if normalized_time_filter else None),
                 }
                 self.logger.info(
                     f"[时间过滤诊断][MemoryManager综合检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
@@ -301,18 +307,48 @@ class MemoryManager:
             ordered_ids = [mid for mid, _ in id_scores]
             sql_memories = await self.memory_sql_manager.get_memories_by_ids(ordered_ids)
             filtered: List[BaseMemory] = []
+            fallback_filtered: List[BaseMemory] = []
             for mem in sql_memories:
                 if not self._is_scope_allowed(getattr(mem, "memory_scope", "public"), memory_scope):
                     continue
-                if not self._matches_time_filter(mem, normalized_time_filter):
+                base_score = float(score_map.get(mem.id, 0.0))
+                if normalized_time_filter:
+                    match = classify_memory_time_match(mem, normalized_time_filter)
+                    match_type = str(match.get("match_type", "") or "")
+                    if match_type in {"event_exact", "event_inferred", "source_exact"}:
+                        mem.similarity = base_score + (time_sort_boost(mem, normalized_time_filter) * 0.2)
+                        filtered.append(mem)
+                    elif match_type == "created_at_only":
+                        mem.similarity = base_score * 0.25
+                        fallback_filtered.append(mem)
                     continue
-                mem.similarity = float(score_map.get(mem.id, 0.0))
+                mem.similarity = base_score
                 filtered.append(mem)
-            filtered.sort(key=lambda m: getattr(m, "similarity", 0.0), reverse=True)
+            filtered.sort(
+                key=lambda m: (
+                    getattr(m, "similarity", 0.0),
+                    time_sort_boost(m, normalized_time_filter),
+                    primary_timestamp(m),
+                ),
+                reverse=True,
+            )
+            fallback_filtered.sort(
+                key=lambda m: (getattr(m, "similarity", 0.0), primary_timestamp(m)),
+                reverse=True,
+            )
+            if normalized_time_filter and len(filtered) < int(limit):
+                filtered.extend(fallback_filtered[: max(0, int(limit) - len(filtered))])
             payload = {
                 'mode': 'vector_ids_plus_sql',
                 'time_filter_applied': bool(normalized_time_filter),
                 'result_summary': summarize_memory_records(filtered[:limit]),
+                'event_time_filter_applied': bool(normalized_time_filter),
+                'source_time_filter_applied': bool(normalized_time_filter),
+                'created_at_filter_applied': False,
+                'current_long_term_time_field': 'event/source time primary' if normalized_time_filter else 'semantic_only',
+                'result_summary_by_event_time': summarize_memories_by_time_field(filtered[:limit], field='event'),
+                'result_summary_by_created_at': summarize_memories_by_time_field(filtered[:limit], field='created_at'),
+                'time_field_usage': build_result_time_usage(filtered[:limit], normalized_time_filter if normalized_time_filter else None),
             }
             self.logger.info(
                 f"[时间过滤诊断][MemoryManager综合检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
@@ -320,12 +356,13 @@ class MemoryManager:
             return filtered[:limit]
 
         # 直接使用混合检索，相似度阈值0.5
+        vector_candidate_limit = int(limit * 5) if normalized_time_filter else int(limit)
         if vector is not None:
             memories = await self.store.recall_with_vector(
                 collection=self.collection,
                 vector=vector,
                 query=processed_query,
-                limit=limit,
+                limit=vector_candidate_limit,
                 where_filter=where_filter,
                 similarity_threshold=0.5,
             )
@@ -333,7 +370,7 @@ class MemoryManager:
             memories = await self.store.recall(
                 collection=self.collection,
                 query=processed_query,
-                limit=limit,
+                limit=vector_candidate_limit,
                 where_filter=where_filter,
                 similarity_threshold=0.5,
             )
@@ -358,15 +395,53 @@ class MemoryManager:
         if batch_updates:
             await self.store.update_memory(self.collection, batch_updates)
 
+        if normalized_time_filter:
+            exact_memories: List[BaseMemory] = []
+            fallback_memories: List[BaseMemory] = []
+            for mem in memories:
+                match = classify_memory_time_match(mem, normalized_time_filter)
+                match_type = str(match.get("match_type", "") or "")
+                if match_type in {"event_exact", "event_inferred", "source_exact"}:
+                    mem.similarity = float(getattr(mem, "similarity", 0.0) or 0.0) + (
+                        time_sort_boost(mem, normalized_time_filter) * 0.2
+                    )
+                    exact_memories.append(mem)
+                elif match_type == "created_at_only":
+                    mem.similarity = float(getattr(mem, "similarity", 0.0) or 0.0) * 0.25
+                    fallback_memories.append(mem)
+            exact_memories.sort(
+                key=lambda m: (
+                    float(getattr(m, "similarity", 0.0) or 0.0),
+                    float(time_sort_boost(m, normalized_time_filter)),
+                    float(primary_timestamp(m) or 0.0),
+                ),
+                reverse=True,
+            )
+            fallback_memories.sort(
+                key=lambda m: (
+                    float(getattr(m, "similarity", 0.0) or 0.0),
+                    float(primary_timestamp(m) or 0.0),
+                ),
+                reverse=True,
+            )
+            memories = exact_memories + fallback_memories[: max(0, int(limit) - len(exact_memories))]
+
         payload = {
             'mode': 'vector_only',
             'time_filter_applied': bool(normalized_time_filter),
             'result_summary': summarize_memory_records(memories[:limit]),
+            'event_time_filter_applied': bool(normalized_time_filter),
+            'source_time_filter_applied': bool(normalized_time_filter),
+            'created_at_filter_applied': False,
+            'current_long_term_time_field': 'event/source time primary' if normalized_time_filter else 'semantic_only',
+            'result_summary_by_event_time': summarize_memories_by_time_field(memories[:limit], field='event'),
+            'result_summary_by_created_at': summarize_memories_by_time_field(memories[:limit], field='created_at'),
+            'time_field_usage': build_result_time_usage(memories[:limit], normalized_time_filter if normalized_time_filter else None),
         }
         self.logger.info(
             f"[时间过滤诊断][MemoryManager综合检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
-        return memories
+        return memories[:limit]
 
     async def chained_recall(
         self,
@@ -429,6 +504,12 @@ class MemoryManager:
             'candidate_count': len(candidate_pool),
             'time_filter_applied': bool(normalized_time_filter),
             'candidate_summary': summarize_memory_records(candidate_pool),
+            'event_time_filter_applied': bool(normalized_time_filter),
+            'source_time_filter_applied': bool(normalized_time_filter),
+            'created_at_filter_applied': False,
+            'result_summary_by_event_time': summarize_memories_by_time_field(candidate_pool, field='event'),
+            'result_summary_by_created_at': summarize_memories_by_time_field(candidate_pool, field='created_at'),
+            'time_field_usage': build_result_time_usage(candidate_pool, normalized_time_filter if normalized_time_filter else None),
         }
         self.logger.info(
             f"[时间过滤诊断][MemoryManager链式召回候选池] payload={json.dumps(payload, ensure_ascii=False)}"
@@ -468,6 +549,12 @@ class MemoryManager:
             'typed_count': sum(len(v) for v in type_memories.values()),
             'time_filter_applied': bool(normalized_time_filter),
             'result_summary': summarize_memory_records(all_memories),
+            'event_time_filter_applied': bool(normalized_time_filter),
+            'source_time_filter_applied': bool(normalized_time_filter),
+            'created_at_filter_applied': False,
+            'result_summary_by_event_time': summarize_memories_by_time_field(all_memories, field='event'),
+            'result_summary_by_created_at': summarize_memories_by_time_field(all_memories, field='created_at'),
+            'time_field_usage': build_result_time_usage(all_memories, normalized_time_filter if normalized_time_filter else None),
         }
         self.logger.info(
             f"[时间过滤诊断][MemoryManager链式召回结果] payload={json.dumps(payload, ensure_ascii=False)}"
@@ -776,7 +863,11 @@ class MemoryManager:
             handler = memory_handlers.get(mem_type)
             if handler:
                 new_memory_object = await handler.remember(
-                    judgment, reasoning, tags, memory_scope=resolved_scope
+                    judgment,
+                    reasoning,
+                    tags,
+                    memory_scope=resolved_scope,
+                    time_metadata=mem_data,
                 )
             else:
                 self.logger.warning(f"未找到记忆类型 {mem_type} 的处理器，跳过创建")

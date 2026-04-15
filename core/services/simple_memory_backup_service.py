@@ -70,6 +70,12 @@ class SimpleMemoryBackupService:
                     "strength": meta.get("strength", 1),
                     "is_active": meta.get("is_active", False),
                     "memory_scope": meta.get("memory_scope", "public"),
+                    "source_message_ids": meta.get("source_message_ids", []),
+                    "source_start_ts": meta.get("source_start_ts", 0.0),
+                    "source_end_ts": meta.get("source_end_ts", 0.0),
+                    "event_start_ts": meta.get("event_start_ts", 0.0),
+                    "event_end_ts": meta.get("event_end_ts", 0.0),
+                    "event_time_confidence": meta.get("event_time_confidence", "low_confidence"),
                     "created_at": meta.get("created_at") or int(time.time()),
                 }
             )

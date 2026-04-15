@@ -17,6 +17,7 @@ class MemoryRuntime(Protocol):
         is_active: bool = False,
         strength: Optional[int] = None,
         memory_scope: str = "public",
+        time_metadata: Optional[dict] = None,
     ) -> str:
         ...
 

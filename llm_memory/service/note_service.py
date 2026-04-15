@@ -1,8 +1,7 @@
 """
-笔记服务（重构版）
+笔记服务（重构版）。
 
-仅保留中央 SQL 索引 + notes_index 轻量向量索引链路。
-不再支持“正文全量向量化”旧链路，也不提供回退。
+保留 SQL 索引 + notes_index 轻量向量索引链路，不再支持旧的正文全量向量化链路。
 """
 
 import asyncio
@@ -45,7 +44,7 @@ class NoteService:
 
         if plugin_context:
             self.id_service = IDService.from_plugin_context(plugin_context)
-            self.logger.info("笔记服务初始化完成（PluginContext模式）")
+            self.logger.info("笔记服务初始化完成（PluginContext 模式）")
         elif vector_store:
             self.id_service = IDService()
             self._initialize_collections()
@@ -64,7 +63,7 @@ class NoteService:
     def set_vector_store(self, vector_store):
         self.vector_store = vector_store
         self._initialize_collections()
-        self.logger.info("VectorStore已设置，notes_index集合初始化完成")
+        self.logger.info("VectorStore 已设置，notes_index 集合初始化完成")
 
     def _get_memory_sql_manager(self):
         if self.plugin_context is None:
@@ -73,6 +72,19 @@ class NoteService:
         if memory_sql_manager is None:
             raise RuntimeError("memory_sql_manager 不可用，笔记新链路无法执行")
         return memory_sql_manager
+
+    @staticmethod
+    def _build_time_filter_diagnostic(
+        time_filter: Optional[Dict],
+        note: str,
+    ) -> Dict:
+        return {
+            "time_filter_supported": False,
+            "time_filter_requested": bool(time_filter),
+            "time_filter_requested_payload": time_filter or {},
+            "time_filter_applied": False,
+            "time_filter_note": note,
+        }
 
     def ensure_ready(self):
         self._get_memory_sql_manager()
@@ -96,28 +108,45 @@ class NoteService:
         top_k: int = 20,
         tag_filter: List[str] = None,
         vector: Optional[List[float]] = None,
+        time_filter: Optional[Dict] = None,
     ) -> List[Dict]:
         del tag_filter
+
+        entry_payload = {
+            "query_preview": preview_text(query, 160),
+            "recall_count": int(recall_count),
+            "top_k": int(top_k),
+            "has_vector": vector is not None,
+            **self._build_time_filter_diagnostic(
+                time_filter,
+                "NoteService.search_notes_by_top_k 当前不支持 time_filter，传入后仅记录日志，不会参与筛选。",
+            ),
+        }
         self.logger.info(
-            "[时间过滤诊断][笔记服务检索入参] payload="
-            f"{json.dumps({
-                'query_preview': preview_text(query, 160),
-                'recall_count': int(recall_count),
-                'top_k': int(top_k),
-                'has_vector': vector is not None,
-                'time_filter_supported': False,
-                'time_filter_note': 'NoteService.search_notes_by_top_k 未接收时间窗口参数。'
-            }, ensure_ascii=False)}"
+            "[时间过滤诊断][笔记服务检索入口] payload="
+            f"{json.dumps(entry_payload, ensure_ascii=False)}"
         )
-        candidates = await self._search_notes_v2(query=query, recall_count=recall_count, vector=vector)
+
+        candidates = await self._search_notes_v2(
+            query=query,
+            recall_count=recall_count,
+            vector=vector,
+            time_filter=time_filter,
+        )
         selected = candidates[: max(0, int(top_k))]
+
+        result_payload = {
+            "candidate_count": len(candidates),
+            "selected_count": len(selected),
+            "summary": summarize_note_records(selected),
+            **self._build_time_filter_diagnostic(
+                time_filter,
+                "笔记结果未应用 time_filter，请勿把 note 结果误判为已按时间窗过滤。",
+            ),
+        }
         self.logger.info(
             "[时间过滤诊断][笔记服务检索结果] payload="
-            f"{json.dumps({
-                'candidate_count': len(candidates),
-                'selected_count': len(selected),
-                'summary': summarize_note_records(selected),
-            }, ensure_ascii=False)}"
+            f"{json.dumps(result_payload, ensure_ascii=False)}"
         )
         return selected
 
@@ -126,17 +155,22 @@ class NoteService:
         query: str,
         recall_count: int = 100,
         vector: Optional[List[float]] = None,
+        time_filter: Optional[Dict] = None,
     ) -> List[Dict]:
         memory_sql_manager = self._get_memory_sql_manager()
+
+        low_level_payload = {
+            "query_preview": preview_text(query, 160),
+            "recall_count": int(recall_count),
+            "has_vector": vector is not None,
+            **self._build_time_filter_diagnostic(
+                time_filter,
+                "底层笔记检索仅接收 query、recall_count、vector，当前不支持 time_filter。",
+            ),
+        }
         self.logger.info(
             "[时间过滤诊断][笔记底层检索] payload="
-            f"{json.dumps({
-                'query_preview': preview_text(query, 160),
-                'recall_count': int(recall_count),
-                'has_vector': vector is not None,
-                'time_filter_supported': False,
-                'time_filter_note': '底层笔记检索仅接收 query/recall_count/vector。'
-            }, ensure_ascii=False)}"
+            f"{json.dumps(low_level_payload, ensure_ascii=False)}"
         )
 
         rows: List[Dict] = []
@@ -150,12 +184,13 @@ class NoteService:
                     similarity_threshold=0.5,
                 )
             except Exception as e:
-                # notes_index 在睡眠维护中可能被重建，旧句柄会失效；此处自动刷新并重试一次。
                 msg = str(e)
                 if "does not exist" in msg or "Error getting collection" in msg:
                     self.logger.warning("notes_index 集合句柄已失效，正在自动刷新并重试。")
                     self.notes_index_collection = (
-                        self.vector_store.get_or_create_collection_with_dimension_check("notes_index")
+                        self.vector_store.get_or_create_collection_with_dimension_check(
+                            "notes_index"
+                        )
                     )
                     recalled = await self.vector_store.recall_note_source_ids(
                         collection=self.notes_index_collection,
@@ -174,7 +209,10 @@ class NoteService:
                 vector_scores=score_map if source_ids else None,
             )
         else:
-            rows = await memory_sql_manager.search_note_index_by_tags(query=query, limit=recall_count)
+            rows = await memory_sql_manager.search_note_index_by_tags(
+                query=query,
+                limit=recall_count,
+            )
             for row in rows:
                 raw_similarity = row.get("similarity", None)
                 if raw_similarity is None:
@@ -250,7 +288,12 @@ class NoteService:
         timings["delete_old_index"] = (time.time() - t0) * 1000
 
         t0 = time.time()
-        entries = self._build_note_index_entries(file_path, relative_path, str(file_id), file_timestamp)
+        entries = self._build_note_index_entries(
+            file_path,
+            relative_path,
+            str(file_id),
+            file_timestamp,
+        )
         timings["parse"] = (time.time() - t0) * 1000
 
         t0 = time.time()
@@ -321,7 +364,7 @@ class NoteService:
                 }
             ]
 
-        # 叶子节点索引：仅为“没有子标题”的标题节点建索引
+        # 仅为叶子标题节点建索引，减少噪音候选。
         entries: List[Dict] = []
         current_h = ["", "", "", "", "", ""]
         leaf_index = 0
@@ -384,7 +427,11 @@ class NoteService:
                 content = ""
             if extension == ".md":
                 return self._build_markdown_entries(
-                    content, relative_path, file_id, updated_at, total_lines
+                    content,
+                    relative_path,
+                    file_id,
+                    updated_at,
+                    total_lines,
                 )
 
         path_tags = self._extract_path_tags(relative_path)
@@ -427,7 +474,7 @@ class NoteService:
                     self.logger.warning(f"删除 notes_index 缓存失败（不影响主流程）: {e}")
             return True
         except Exception as e:
-            self.logger.error(f"根据file_id删除文件数据失败: {file_id}, 错误: {e}")
+            self.logger.error(f"根据 file_id 删除文件数据失败: {file_id}, 错误: {e}")
             return False
 
     def close(self):

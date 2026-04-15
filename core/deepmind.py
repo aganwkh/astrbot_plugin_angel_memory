@@ -34,6 +34,7 @@ from .session_memory import SessionMemoryManager
 from .memory_runtime import MemoryRuntime
 from .utils import SmallModelPromptBuilder, MemoryInjector
 from .utils.query_processor import get_query_processor
+from .utils.memory_time import derive_time_metadata_from_chat_records
 from .services.retrieval_service import DeepMindRetrievalService
 from .services.injection_service import DeepMindInjectionService
 from .services.feedback_service import DeepMindFeedbackService
@@ -385,15 +386,9 @@ class DeepMind:
             recall_policy = {
                 "recall_request": recall_request,
                 "time_filter": fallback_time_filter,
-                "strict_time_recall": bool(
-                    fallback_time_filter.get("matched") and recall_request.get("matched")
-                ),
-                "restrict_injection": bool(
-                    fallback_time_filter.get("matched") and recall_request.get("matched")
-                ),
-                "skip_notes": bool(
-                    fallback_time_filter.get("matched") and recall_request.get("matched")
-                ),
+                "strict_time_recall": bool(fallback_time_filter.get("matched")),
+                "restrict_injection": bool(fallback_time_filter.get("matched")),
+                "skip_notes": bool(fallback_time_filter.get("matched")),
                 "prefer_raw_chat_only": False,
             }
             setattr(event, "_angel_memory_recall_policy", recall_policy)
@@ -421,6 +416,7 @@ class DeepMind:
         chat_records: List[Dict[str, Any]] = []
         unprocessed_chat_records: List[Dict[str, Any]] = []
         secretary_decision = {}
+        secretary_parse_failed = False
         if hasattr(event, "angelheart_context"):
             try:
                 angelheart_data = json.loads(event.angelheart_context)
@@ -434,6 +430,7 @@ class DeepMind:
                 ]
                 secretary_decision = angelheart_data.get("secretary_decision", {}) or {}
             except (json.JSONDecodeError, KeyError, TypeError):
+                secretary_parse_failed = True
                 self.logger.error(f"为会话 {session_id} 解析 angelheart_context 失败")
 
         # 2. 从 secretary_decision 构建查询字符串
@@ -477,12 +474,34 @@ class DeepMind:
             "intermediate_query": query,
             "intermediate_query_preview": preview_text(query, 160),
             "time_intent_from_raw_to_intermediate": raw_to_intermediate,
+            "angelheart_context_type": type(getattr(event, "angelheart_context", None)).__name__,
             "secretary_topic": preview_text(
                 str(secretary_decision.get("topic", "") or ""), 80
             ),
             "secretary_entities": list(secretary_decision.get("entities", []) or [])[:5],
             "secretary_facts": list(secretary_decision.get("facts", []) or [])[:3],
             "secretary_keywords": list(secretary_decision.get("keywords", []) or [])[:3],
+            "secretary_parse_failed": secretary_parse_failed,
+            "secretary_topic_status": (
+                "parse_failed"
+                if secretary_parse_failed
+                else "present" if str(secretary_decision.get("topic", "") or "").strip() else "upstream_empty"
+            ),
+            "secretary_entities_status": (
+                "parse_failed"
+                if secretary_parse_failed
+                else "present" if list(secretary_decision.get("entities", []) or []) else "upstream_empty"
+            ),
+            "secretary_facts_status": (
+                "parse_failed"
+                if secretary_parse_failed
+                else "present" if list(secretary_decision.get("facts", []) or []) else "upstream_empty"
+            ),
+            "secretary_keywords_status": (
+                "parse_failed"
+                if secretary_parse_failed
+                else "present" if list(secretary_decision.get("keywords", []) or []) else "upstream_empty"
+            ),
         }
         diagnostic_store["query_build"] = query_build_payload
         self.logger.info(
@@ -1074,6 +1093,26 @@ class DeepMind:
                 self.logger.info(f"[反思调度] 完成 session={session_id}")
         return bool(success)
 
+    def _enrich_new_memories_with_time_metadata(
+        self,
+        new_memories: List[Dict[str, Any]],
+        raw_chat_records: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(new_memories, list):
+            return []
+
+        shared_time_metadata = derive_time_metadata_from_chat_records(raw_chat_records)
+        enriched_memories: List[Dict[str, Any]] = []
+        for mem in new_memories:
+            if not isinstance(mem, dict):
+                continue
+            enriched = dict(mem)
+            for key, value in shared_time_metadata.items():
+                if enriched.get(key) in (None, "", [], 0, 0.0):
+                    enriched[key] = value
+            enriched_memories.append(enriched)
+        return enriched_memories
+
     async def _execute_async_analysis_task(
         self,
         reflection_input: ReflectionInput,
@@ -1234,6 +1273,10 @@ class DeepMind:
             # 2. 调用已有的工具函数，将其转换为底层服务期望的"扁平列表"格式
             new_memories_normalized = MemoryIDResolver.normalize_new_memories_format(
                 new_memories_raw, self.logger
+            )
+            new_memories_normalized = self._enrich_new_memories_with_time_metadata(
+                new_memories_normalized,
+                raw_chat_records if isinstance(raw_chat_records, list) else [],
             )
 
             # --- 记忆生成限制 (基于灵魂 ImpressionDepth) ---

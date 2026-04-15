@@ -94,6 +94,17 @@ def _install_memory_manager_test_stubs() -> None:
 
 def _load_memory_manager():
     _install_memory_manager_test_stubs()
+    memory_time_name = f"{TEST_PACKAGE}.core.utils.memory_time"
+    if memory_time_name not in sys.modules:
+        memory_time_path = ROOT / "core" / "utils" / "memory_time.py"
+        memory_time_spec = importlib.util.spec_from_file_location(
+            memory_time_name, memory_time_path
+        )
+        if memory_time_spec is None or memory_time_spec.loader is None:
+            raise RuntimeError(f"failed to load module from {memory_time_path}")
+        memory_time_module = importlib.util.module_from_spec(memory_time_spec)
+        sys.modules[memory_time_name] = memory_time_module
+        memory_time_spec.loader.exec_module(memory_time_module)
     module_name = f"{TEST_PACKAGE}.llm_memory.service.memory_manager"
     module = sys.modules.get(module_name)
     if module is not None:

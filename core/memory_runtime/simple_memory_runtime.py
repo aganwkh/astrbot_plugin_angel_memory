@@ -25,6 +25,7 @@ class SimpleMemoryRuntime:
         is_active: bool = False,
         strength: Optional[int] = None,
         memory_scope: str = "public",
+        time_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         memory = await self._manager.remember(
             memory_type=memory_type,
@@ -34,6 +35,7 @@ class SimpleMemoryRuntime:
             is_active=is_active,
             strength=strength,
             memory_scope=memory_scope,
+            time_metadata=time_metadata,
         )
         return memory.id
 
