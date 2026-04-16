@@ -1786,7 +1786,7 @@ class MemorySqlManager:
                     source_start_ts, source_end_ts,
                     event_start_ts, event_end_ts, event_time_confidence,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory.id,
@@ -1867,7 +1867,7 @@ class MemorySqlManager:
                     source_start_ts, source_end_ts,
                     event_start_ts, event_end_ts, event_time_confidence,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     memory_type=excluded.memory_type,
                     judgment=excluded.judgment,
@@ -2099,7 +2099,7 @@ class MemorySqlManager:
                                 source_start_ts, source_end_ts,
                                 event_start_ts, event_end_ts, event_time_confidence,
                                 created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 memory_id,
@@ -2864,7 +2864,7 @@ class MemorySqlManager:
                         source_start_ts, source_end_ts,
                         event_start_ts, event_end_ts, event_time_confidence,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_memory.id,

@@ -1,6 +1,8 @@
+import ast
 import importlib.util
 import logging
 import sys
+import re
 import types
 import unittest
 from pathlib import Path
@@ -197,6 +199,63 @@ class MemoryManagerRegressionTests(unittest.IsolatedAsyncioTestCase):
                     "vector_text": "prefers black coffee | user | drink",
                 }
             ],
+        )
+
+    def test_memory_record_insert_statements_have_matching_arity(self):
+        source_path = ROOT / "llm_memory" / "components" / "memory_sql_manager.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+        failures = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr != "execute":
+                continue
+
+            sql_node = node.args[0]
+            if not isinstance(sql_node, ast.Constant) or not isinstance(sql_node.value, str):
+                continue
+
+            sql_text = sql_node.value
+            if "INSERT INTO memory_records(" not in sql_text:
+                continue
+
+            match = re.search(
+                r"INSERT INTO memory_records\((?P<cols>.*?)\)\s*VALUES\s*\((?P<vals>.*?)\)",
+                sql_text,
+                re.S,
+            )
+            self.assertIsNotNone(match, f"failed to parse INSERT statement at line {node.lineno}")
+            assert match is not None
+
+            columns = [column.strip() for column in match.group("cols").split(",") if column.strip()]
+            placeholders = re.findall(r"\?", match.group("vals"))
+            params_node = node.args[1]
+            if isinstance(params_node, ast.Tuple):
+                param_count = len(params_node.elts)
+            else:
+                self.fail(
+                    f"INSERT at line {node.lineno} does not pass a tuple literal as parameters"
+                )
+
+            if not (len(columns) == len(placeholders) == param_count):
+                failures.append(
+                    {
+                        "line": node.lineno,
+                        "columns": len(columns),
+                        "placeholders": len(placeholders),
+                        "params": param_count,
+                    }
+                )
+
+        self.assertFalse(
+            failures,
+            "memory_records insert arity mismatch: "
+            + ", ".join(
+                f"line {item['line']} columns={item['columns']} placeholders={item['placeholders']} params={item['params']}"
+                for item in failures
+            ),
         )
 
 
