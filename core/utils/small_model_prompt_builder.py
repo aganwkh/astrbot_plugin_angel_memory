@@ -62,7 +62,6 @@ class SmallModelPromptBuilder:
     def format_chat_records(chat_records: List[Dict]) -> Tuple[str, List[Dict]]:
         """
         格式化对话历史为可读文本，并生成对话参与者清单。
-
         Args:
             chat_records: 对话记录列表
 
@@ -75,44 +74,41 @@ class SmallModelPromptBuilder:
         participants = {}  # 使用字典去重，key为sender_id
 
         for msg in chat_records:
-            role = msg.get("role")
+            role = str(msg.get("role") or "").strip()
 
-            # 过滤掉toolcall相关消息
+            # 过滤掉 toolcall 相关消息
             if msg.get("is_structured_toolcall"):
-                continue  # 跳过结构化toolcall消息
+                continue
 
-            # 检查内容中是否包含toolcall关键词
             content = msg.get("content", "")
             if isinstance(content, str):
-                toolcall_keywords = ["调用", "tool_call", "function", "工具调用结果："]
+                toolcall_keywords = ["调用", "tool_call", "function", "工具调用结果"]
                 if any(keyword in content for keyword in toolcall_keywords):
-                    continue  # 跳过包含toolcall关键词的消息
+                    continue
 
             if role == "user":
-                sender_name = msg.get("sender_name", "成员")
-                sender_id = msg.get("sender_id", "Unknown")
+                sender_name = str(msg.get("sender_name", "成员") or "成员")
+                sender_id = str(msg.get("sender_id", "Unknown") or "Unknown")
 
-                # 构建参与者清单
                 if sender_id != "Unknown" and sender_id not in participants:
                     participants[sender_id] = {"id": sender_id, "name": sender_name}
 
-                # 格式化对话文本
                 timestamp = msg.get("timestamp", 0)
                 time_str = SmallModelPromptBuilder.format_relative_time(timestamp)
-                header = f"[群友: {sender_name}（{sender_id}）]（{time_str}）: "
-                content = msg.get("content", [])
                 text = SmallModelPromptBuilder.extract_text_from_content(content)
+                header = f"[用户说] {sender_name}({sender_id})[{time_str}] "
                 formatted_lines.append(f"{header}{text}")
+                continue
 
-            else:  # assistant
-                content = msg.get("content", "")
+            if role == "assistant":
                 text = SmallModelPromptBuilder.extract_text_from_content(content)
-                formatted_lines.append(f"[助理]: {text}")
+                formatted_lines.append(f"[助理说] {text}")
+                continue
 
-        # 将去重后的参与者字典转换为列表
+            text = SmallModelPromptBuilder.extract_text_from_content(content)
+            formatted_lines.append(f"[{role or '未知'}] {text}")
+
         user_list = list(participants.values())
-
-        # 返回包含两项内容的元组
         return "\n".join(formatted_lines), user_list
 
     @staticmethod

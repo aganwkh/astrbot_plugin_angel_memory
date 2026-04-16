@@ -1,10 +1,11 @@
 """
 记忆格式化器
 
-负责将记忆格式化为统一的文本格式，便于阅读和理解。
+负责将记忆格式化为统一的文本形式，便于阅读和理解。
 """
 
 from typing import List, Dict, Any, Optional
+
 from ..session_memory import MemoryItem
 from ..config import MemoryConstants
 
@@ -12,7 +13,6 @@ from ..config import MemoryConstants
 class MemoryFormatter:
     """记忆格式化器"""
 
-    # 记忆类型到中文的映射
     MEMORY_TYPE_NAMES = MemoryConstants.MEMORY_TYPE_NAMES
 
     @staticmethod
@@ -25,7 +25,32 @@ class MemoryFormatter:
             "user_said": "[用户说]",
             "assistant_said": "[助理说]",
         }
-        return label_map.get(perspective, "")
+        label = label_map.get(perspective, "")
+        if label:
+            return label
+
+        source_roles = [
+            str(role).strip()
+            for role in (getattr(memory, "source_message_roles", []) or [])
+            if str(role or "").strip()
+        ]
+        source_roles_set = set(source_roles)
+        primary_role = str(getattr(memory, "primary_speaker_role", "") or "").strip()
+        secondary_role = str(getattr(memory, "secondary_speaker_role", "") or "").strip()
+
+        if "assistant" in source_roles_set and "user" in source_roles_set:
+            return "[双方对话]"
+        if primary_role == "assistant" or (
+            not source_roles_set and bool(getattr(memory, "source_message_is_bot", False))
+        ):
+            return "[助理说]"
+        if primary_role == "user" or "user" in source_roles_set:
+            return "[用户说]"
+        if secondary_role == "assistant":
+            return "[助理说]"
+        if secondary_role == "user":
+            return "[用户说]"
+        return ""
 
     @staticmethod
     def _format_memory_body(memory: MemoryItem) -> str:
@@ -39,42 +64,14 @@ class MemoryFormatter:
 
     @staticmethod
     def format_single_memory(memory: MemoryItem) -> str:
-        """
-        格式化单条记忆
-
-        Args:
-            memory: 记忆对象
-
-        Returns:
-            格式化后的记忆文本
-        """
-        # 处理 MemoryItem 对象的 memory_type 属性
-
-        # 格式化论点
-        judgment = memory.judgment.strip()
-
-        # 格式化理由
-        reasoning = ""
-        if memory.reasoning and memory.reasoning.strip():
-            reasoning = f"\n——因为{memory.reasoning.strip()}"
-
+        """格式化单条记忆。"""
         return MemoryFormatter._format_memory_body(memory)
 
     @staticmethod
     def format_memories_by_type(memories: List[MemoryItem]) -> Dict[str, List[str]]:
-        """
-        按类型分组格式化记忆
-
-        Args:
-            memories: 记忆列表
-
-        Returns:
-            按类型分组的格式化记忆字典
-        """
-        # 按类型分组（使用setdefault简化）
-        grouped_memories = {}
+        """按类型分组格式化记忆。"""
+        grouped_memories: Dict[str, List[str]] = {}
         for memory in memories:
-            # 处理 MemoryItem 对象的 memory_type 属性
             type_value = memory.memory_type
             type_name = MemoryFormatter.MEMORY_TYPE_NAMES.get(type_value, type_value)
             grouped_memories.setdefault(type_name, []).append(
@@ -88,31 +85,18 @@ class MemoryFormatter:
         useful_memory_ids: Optional[List[str]] = None,
         new_memories: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """
-        格式化记忆用于提示词
-
-        Args:
-            memories: 记忆列表
-            useful_memory_ids: 有用记忆ID列表
-            new_memories: 新记忆列表
-
-        Returns:
-            格式化后的记忆文本
-        """
+        """格式化记忆用于提示词。"""
         if not memories and not new_memories:
             return ""
 
-        # 创建ID到记忆的映射
         memory_map = {memory.id: memory for memory in memories}
-        memories_to_format = []
+        memories_to_format: List[MemoryItem] = []
 
-        # 添加有用的历史记忆（使用列表推导式）
         if useful_memory_ids:
             memories_to_format.extend(
                 memory_map[mid] for mid in useful_memory_ids if mid in memory_map
             )
 
-        # 添加新记忆（使用列表推导式）
         if new_memories:
             memories_to_format.extend(
                 MemoryItem(
@@ -136,103 +120,60 @@ class MemoryFormatter:
         if not memories_to_format:
             return ""
 
-        # 按类型分组并格式化
         grouped_memories = MemoryFormatter.format_memories_by_type(memories_to_format)
-
-        # 构建最终文本（使用extend简化）
         formatted_lines = ["[相关记忆]"]
         for memory_type, formatted_memories in grouped_memories.items():
             formatted_lines.append(f"\n[{memory_type}]")
-            formatted_lines.extend(
-                f"\n{memory_text}" for memory_text in formatted_memories
-            )
+            formatted_lines.extend(f"\n{text}" for text in formatted_memories)
 
         return "".join(formatted_lines)
 
     @staticmethod
     def _deduplicate_memories(memories: List[MemoryItem]) -> List[MemoryItem]:
-        """
-        去重记忆列表，基于judgment文本内容
-
-        Args:
-            memories: 记忆列表
-
-        Returns:
-            去重后的记忆列表
-        """
+        """按 judgment 去重。"""
         seen_judgments = set()
-        deduplicated = []
-
+        deduplicated: List[MemoryItem] = []
         for memory in memories:
-            # 标准化judgment文本用于比较
-            normalized_judgment = memory.judgment.strip().lower()
+            normalized_judgment = str(memory.judgment or "").strip().lower()
             if normalized_judgment not in seen_judgments:
                 seen_judgments.add(normalized_judgment)
                 deduplicated.append(memory)
-
         return deduplicated
 
     @staticmethod
     def format_session_memories(memories: List[MemoryItem]) -> str:
-        """
-        格式化会话短期记忆列表，无过滤，但会去重。
-
-        Args:
-            memories: 记忆列表
-
-        Returns:
-            格式化后的记忆文本
-        """
+        """格式化会话短期记忆。"""
         if not memories:
             return ""
 
-        # 去重处理
         deduplicated_memories = MemoryFormatter._deduplicate_memories(memories)
-
-        # 按类型分组并格式化
         grouped_memories = MemoryFormatter.format_memories_by_type(deduplicated_memories)
 
-        # 构建最终文本
         formatted_lines = ["[相关记忆]"]
         for memory_type, formatted_memories in grouped_memories.items():
             formatted_lines.append(f"\n[{memory_type}]")
-            formatted_lines.extend(
-                f"\n{memory_text}" for memory_text in formatted_memories
-            )
+            formatted_lines.extend(f"\n{text}" for text in formatted_memories)
 
         return "".join(formatted_lines)
 
-    
-
     @staticmethod
     def format_memories_for_display(memories: List[MemoryItem]) -> str:
-        """
-        格式化记忆用于显示
-
-        Args:
-            memories: 记忆列表
-
-        Returns:
-            格式化后的记忆文本
-        """
+        """格式化记忆用于显示。"""
         if not memories:
             return "暂无记忆"
 
-        # 按类型分组（保留原始对象）
         from .memory_id_resolver import MemoryIDResolver
 
-        grouped = {}
+        grouped: Dict[str, List[MemoryItem]] = {}
         for memory in memories:
-            # 处理 MemoryItem 对象的 memory_type 属性
             type_value = memory.memory_type
             type_name = MemoryFormatter.MEMORY_TYPE_NAMES.get(type_value, type_value)
             grouped.setdefault(type_name, []).append(memory)
 
-        display_lines = []
+        display_lines: List[str] = []
         for memory_type, memory_list in grouped.items():
             display_lines.append(f"\n=== {memory_type} ===")
             for i, memory in enumerate(memory_list, 1):
-                # 生成短ID并格式化记忆
                 short_id = MemoryIDResolver.generate_short_id(memory.id)
                 display_lines.append(
                     f"\n{i}. [id:{short_id}]{MemoryFormatter._format_memory_body(memory)}"
