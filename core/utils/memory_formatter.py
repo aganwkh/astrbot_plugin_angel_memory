@@ -16,6 +16,28 @@ class MemoryFormatter:
     MEMORY_TYPE_NAMES = MemoryConstants.MEMORY_TYPE_NAMES
 
     @staticmethod
+    def _memory_perspective_label(memory: MemoryItem) -> str:
+        perspective = str(getattr(memory, "memory_perspective", "") or "").strip()
+        label_map = {
+            "user_fact": "[用户事实]",
+            "assistant_fact": "[助理事实]",
+            "shared_dialogue": "[双方对话]",
+            "user_said": "[用户说]",
+            "assistant_said": "[助理说]",
+        }
+        return label_map.get(perspective, "")
+
+    @staticmethod
+    def _format_memory_body(memory: MemoryItem) -> str:
+        judgment = str(getattr(memory, "judgment", "") or "").strip()
+        reasoning = str(getattr(memory, "reasoning", "") or "").strip()
+        prefix = MemoryFormatter._memory_perspective_label(memory)
+        body = f"{prefix}{judgment}" if prefix else judgment
+        if reasoning:
+            body = f"{body}\n——因为{reasoning}"
+        return body
+
+    @staticmethod
     def format_single_memory(memory: MemoryItem) -> str:
         """
         格式化单条记忆
@@ -36,7 +58,7 @@ class MemoryFormatter:
         if memory.reasoning and memory.reasoning.strip():
             reasoning = f"\n——因为{memory.reasoning.strip()}"
 
-        return f"{judgment}{reasoning}"
+        return MemoryFormatter._format_memory_body(memory)
 
     @staticmethod
     def format_memories_by_type(memories: List[MemoryItem]) -> Dict[str, List[str]]:
@@ -56,7 +78,7 @@ class MemoryFormatter:
             type_value = memory.memory_type
             type_name = MemoryFormatter.MEMORY_TYPE_NAMES.get(type_value, type_value)
             grouped_memories.setdefault(type_name, []).append(
-                MemoryFormatter.format_single_memory(memory)
+                MemoryFormatter._format_memory_body(memory)
             )
         return grouped_memories
 
@@ -100,6 +122,13 @@ class MemoryFormatter:
                     reasoning=nm.get("reasoning", ""),
                     tags=nm.get("tags", []),
                     strength=nm.get("strength", 0.5),
+                    source_message_ids=nm.get("source_message_ids", []),
+                    source_message_roles=nm.get("source_message_roles", []),
+                    source_message_senders=nm.get("source_message_senders", []),
+                    source_message_is_bot=bool(nm.get("source_message_is_bot", False)),
+                    primary_speaker_role=nm.get("primary_speaker_role", ""),
+                    secondary_speaker_role=nm.get("secondary_speaker_role", ""),
+                    memory_perspective=nm.get("memory_perspective", ""),
                 )
                 for nm in new_memories
             )
@@ -205,12 +234,8 @@ class MemoryFormatter:
             for i, memory in enumerate(memory_list, 1):
                 # 生成短ID并格式化记忆
                 short_id = MemoryIDResolver.generate_short_id(memory.id)
-                judgment = memory.judgment.strip()
-                reasoning = (
-                    f"\n   ——因为{memory.reasoning.strip()}"
-                    if memory.reasoning and memory.reasoning.strip()
-                    else ""
+                display_lines.append(
+                    f"\n{i}. [id:{short_id}]{MemoryFormatter._format_memory_body(memory)}"
                 )
-                display_lines.append(f"\n{i}. [id:{short_id}]{judgment}{reasoning}")
 
         return "".join(display_lines)

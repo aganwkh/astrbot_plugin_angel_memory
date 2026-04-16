@@ -280,9 +280,27 @@ class SmallModelPromptBuilder:
 - **id**: `{short_id}`
 - **type**: `{memory.memory_type.value if hasattr(memory.memory_type, "value") else memory.memory_type}`
 - **judgment**: `{memory.judgment}`
+- **reasoning**: `{getattr(memory, "reasoning", "")}`
+- **source_message_roles**: `{getattr(memory, "source_message_roles", [])}`
+- **source_message_senders**: `{getattr(memory, "source_message_senders", [])}`
+- **source_message_is_bot**: `{getattr(memory, "source_message_is_bot", False)}`
+- **primary_speaker_role**: `{getattr(memory, "primary_speaker_role", "")}`
+- **secondary_speaker_role**: `{getattr(memory, "secondary_speaker_role", "")}`
+- **memory_perspective**: `{getattr(memory, "memory_perspective", "")}`
 """
         else:
             data_context += "\n无相关记忆\n"
+
+        data_context += """
+
+## 角色保留规则
+- 只有在 source_message_roles / source_message_senders 明确支持时，才写“用户说”或“助理说”。
+- 不要把 assistant 的发言改写成“用户认为……”或“用户（user）……”。
+- 不要凭空生成“群友:”等标签，除非原始来源里真的存在对应角色。
+- 如果记忆同时涉及双方互动，请标记为 shared_dialogue，不要硬压成 user_fact。
+- 如果记忆主要描述用户稳定属性或偏好，再使用 user_fact。
+- 输出的 new_memories 中尽量保留 memory_perspective / primary_speaker_role / secondary_speaker_role / source_message_roles / source_message_senders / source_message_is_bot。
+"""
 
         # 组合完整提示词：指南 + 数据
         full_prompt = f"""{guide_content}

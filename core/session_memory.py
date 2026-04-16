@@ -23,6 +23,13 @@ class MemoryItem:
     reasoning: str
     tags: List[str]
     strength: int = 0
+    source_message_ids: List[str] | None = None
+    source_message_roles: List[str] | None = None
+    source_message_senders: List[Dict[str, Any]] | None = None
+    source_message_is_bot: bool = False
+    primary_speaker_role: str = ""
+    secondary_speaker_role: str = ""
+    memory_perspective: str = ""
     life_points: int = 3  # 生命值，新记忆默认3点
     created_at: float = 0.0  # 创建时间戳
 
@@ -262,6 +269,13 @@ class SessionMemory:
             strength=getattr(memory, "strength", 0),
             life_points=3,  # 新记忆默认3点生命值
             created_at=time.time(),  # 记录创建时间
+            source_message_ids=list(getattr(memory, "source_message_ids", []) or []),
+            source_message_roles=list(getattr(memory, "source_message_roles", []) or []),
+            source_message_senders=list(getattr(memory, "source_message_senders", []) or []),
+            source_message_is_bot=bool(getattr(memory, "source_message_is_bot", False)),
+            primary_speaker_role=str(getattr(memory, "primary_speaker_role", "") or ""),
+            secondary_speaker_role=str(getattr(memory, "secondary_speaker_role", "") or ""),
+            memory_perspective=str(getattr(memory, "memory_perspective", "") or ""),
         )
 
     def _add_memory_item(self, memory_item: MemoryItem) -> None:

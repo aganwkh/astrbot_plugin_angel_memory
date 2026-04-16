@@ -709,6 +709,19 @@ class DeepMind:
                 "judgment": memory.judgment,
                 "reasoning": memory.reasoning,
                 "tags": memory.tags,
+                "source_message_ids": list(getattr(memory, "source_message_ids", []) or []),
+                "source_message_roles": list(getattr(memory, "source_message_roles", []) or []),
+                "source_message_senders": list(
+                    getattr(memory, "source_message_senders", []) or []
+                ),
+                "source_message_is_bot": bool(getattr(memory, "source_message_is_bot", False)),
+                "primary_speaker_role": str(
+                    getattr(memory, "primary_speaker_role", "") or ""
+                ),
+                "secondary_speaker_role": str(
+                    getattr(memory, "secondary_speaker_role", "") or ""
+                ),
+                "memory_perspective": str(getattr(memory, "memory_perspective", "") or ""),
             }
             memories_json.append(memory_data)
 
@@ -1113,6 +1126,125 @@ class DeepMind:
             enriched_memories.append(enriched)
         return enriched_memories
 
+    def _build_source_message_metadata(
+        self, chat_records: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        normalized_records = self._dedupe_and_sort_chat_records(chat_records or [])
+        source_message_roles: List[str] = []
+        source_message_senders: List[Dict[str, Any]] = []
+        role_counts: Dict[str, int] = {}
+        seen_senders = set()
+
+        for msg in normalized_records:
+            role = str(msg.get("role", "") or "").strip()
+            if not role:
+                continue
+            role_counts[role] = int(role_counts.get(role, 0) or 0) + 1
+            if role not in source_message_roles:
+                source_message_roles.append(role)
+            sender_id = str(msg.get("sender_id", "") or "").strip()
+            sender_name = str(msg.get("sender_name", "") or "").strip()
+            sender_key = (role, sender_id, sender_name)
+            if sender_key not in seen_senders:
+                seen_senders.add(sender_key)
+                source_message_senders.append(
+                    {
+                        "role": role,
+                        "sender_id": sender_id,
+                        "sender_name": sender_name,
+                    }
+                )
+
+        primary_speaker_role = source_message_roles[0] if source_message_roles else ""
+        secondary_speaker_role = ""
+        for role in source_message_roles[1:]:
+            if role != primary_speaker_role:
+                secondary_speaker_role = role
+                break
+
+        source_message_is_bot = any(
+            str(msg.get("role", "") or "").strip() == "assistant" for msg in normalized_records
+        )
+        memory_perspective = ""
+        if primary_speaker_role == "assistant" and not secondary_speaker_role:
+            memory_perspective = "assistant_said"
+        elif primary_speaker_role == "user" and not secondary_speaker_role:
+            memory_perspective = "user_fact"
+        elif len(source_message_roles) > 1:
+            memory_perspective = "shared_dialogue"
+        elif primary_speaker_role == "assistant":
+            memory_perspective = "assistant_said"
+        elif primary_speaker_role == "user":
+            memory_perspective = "user_said"
+        else:
+            memory_perspective = "shared_dialogue"
+
+        return {
+            "source_message_count": len(normalized_records),
+            "source_message_roles": source_message_roles,
+            "source_message_senders": source_message_senders,
+            "source_message_is_bot": source_message_is_bot,
+            "primary_speaker_role": primary_speaker_role,
+            "secondary_speaker_role": secondary_speaker_role,
+            "memory_perspective": memory_perspective,
+            "role_counts": role_counts,
+        }
+
+    def _enrich_new_memories_with_source_metadata(
+        self,
+        new_memories: List[Dict[str, Any]],
+        source_metadata: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(new_memories, list):
+            return []
+
+        source_message_roles = list(source_metadata.get("source_message_roles", []) or [])
+        source_message_senders = list(source_metadata.get("source_message_senders", []) or [])
+        source_message_is_bot = bool(source_metadata.get("source_message_is_bot", False))
+        primary_speaker_role = str(source_metadata.get("primary_speaker_role", "") or "").strip()
+        secondary_speaker_role = str(source_metadata.get("secondary_speaker_role", "") or "").strip()
+        default_memory_perspective = str(source_metadata.get("memory_perspective", "") or "").strip()
+
+        enriched_memories: List[Dict[str, Any]] = []
+        for mem in new_memories:
+            if not isinstance(mem, dict):
+                continue
+            enriched = dict(mem)
+            if not enriched.get("source_message_roles"):
+                enriched["source_message_roles"] = list(source_message_roles)
+            if not enriched.get("source_message_senders"):
+                enriched["source_message_senders"] = list(source_message_senders)
+            if "source_message_is_bot" not in enriched:
+                enriched["source_message_is_bot"] = source_message_is_bot
+            if not str(enriched.get("primary_speaker_role", "") or "").strip():
+                enriched["primary_speaker_role"] = primary_speaker_role
+            if not str(enriched.get("secondary_speaker_role", "") or "").strip():
+                enriched["secondary_speaker_role"] = secondary_speaker_role
+            if not str(enriched.get("memory_perspective", "") or "").strip():
+                enriched["memory_perspective"] = default_memory_perspective
+            enriched["source_message_count"] = int(source_metadata.get("source_message_count", 0) or 0)
+            enriched_memories.append(enriched)
+        return enriched_memories
+
+    @staticmethod
+    def _summarize_memory_labels(memories: List[Dict[str, Any]]) -> Dict[str, bool]:
+        combined = " ".join(
+            " ".join(
+                [
+                    str(mem.get("judgment", "") or ""),
+                    str(mem.get("reasoning", "") or ""),
+                    str(mem.get("memory_perspective", "") or ""),
+                ]
+            )
+            for mem in memories
+            if isinstance(mem, dict)
+        )
+        return {
+            "contains_user": "用户" in combined or "user" in combined.lower(),
+            "contains_assistant": "助理" in combined or "assistant" in combined.lower(),
+            "contains_groupmate": "群友" in combined,
+        }
+
     async def _execute_async_analysis_task(
         self,
         reflection_input: ReflectionInput,
@@ -1140,6 +1272,17 @@ class DeepMind:
 
             query = str(context_data.get("query", "") or "")
             raw_chat_records = context_data.get("raw_chat_records", [])
+            if not isinstance(raw_chat_records, list):
+                raw_chat_records = []
+            source_metadata = self._build_source_message_metadata(raw_chat_records)
+            self.logger.info(
+                f"[反思落库][source] session={session_id} "
+                f"source_message_count={source_metadata.get('source_message_count', 0)} "
+                f"role_counts={source_metadata.get('role_counts', {})} "
+                f"primary_speaker_role={source_metadata.get('primary_speaker_role', '')} "
+                f"secondary_speaker_role={source_metadata.get('secondary_speaker_role', '')} "
+                f"memory_perspective={source_metadata.get('memory_perspective', '')}"
+            )
             historical_chat_text = ""
             if str(historical_chat_text_override or "").strip():
                 historical_chat_text = str(historical_chat_text_override).strip()
@@ -1278,6 +1421,27 @@ class DeepMind:
                 new_memories_normalized,
                 raw_chat_records if isinstance(raw_chat_records, list) else [],
             )
+            new_memories_normalized = self._enrich_new_memories_with_source_metadata(
+                new_memories_normalized,
+                source_metadata,
+            )
+            summary_flags = self._summarize_memory_labels(new_memories_normalized)
+            generated_learning_content = bool(new_memories_normalized)
+            degraded_mode = not bool(raw_chat_records)
+            degraded_reason = (
+                "missing_raw_chat_records_fallback"
+                if degraded_mode
+                else "normal_reflection"
+            )
+            self.logger.info(
+                f"[反思落库][content] session={session_id} "
+                f"generated_learning_content={generated_learning_content} "
+                f"memory_perspective={source_metadata.get('memory_perspective', '')} "
+                f"summary_contains_user={summary_flags['contains_user']} "
+                f"summary_contains_assistant={summary_flags['contains_assistant']} "
+                f"summary_contains_groupmate={summary_flags['contains_groupmate']} "
+                f"degraded_mode={degraded_mode} reason={degraded_reason}"
+            )
 
             # --- 记忆生成限制 (基于灵魂 ImpressionDepth) ---
             if hasattr(self, "soul") and self.soul and new_memories_normalized:
@@ -1300,6 +1464,9 @@ class DeepMind:
             # 3. 调用封装好的 feedback 接口，并使用"转换后"的扁平列表
             #    (以及我们之前讨论过的，让 feedback 返回新创建的对象)
             newly_created_memories = []
+            persona_applied = False
+            persona_review_written = False
+            session_updates_written = False
             if self.memory_system:
                 # 从反思输入载体获取 persona_name
                 persona_name = getattr(reflection_input, "persona_name", "")
@@ -1314,6 +1481,8 @@ class DeepMind:
                     merge_groups=feedback_data.get("merge_groups", []),
                     memory_scope=memory_scope,
                 )
+                persona_applied = bool(newly_created_memories)
+                persona_review_written = bool(newly_created_memories)
 
             # 2. 更新短期记忆
             # 获取有用的旧记忆
@@ -1328,9 +1497,21 @@ class DeepMind:
                 self.session_memory_manager.add_memories_to_session(
                     session_id, memories_for_session
                 )
+                session_updates_written = True
             self.logger.info(
                 f"[反思执行] 完成 session={session_id} "
                 f"useful={len(useful_ids)} new={len(newly_created_memories)}"
+            )
+            self.logger.info(
+                f"[反思落库][result] session={session_id} "
+                f"style_analysis_success=True "
+                f"generated_learning_content={bool(new_memories_normalized)} "
+                f"persona_applied={persona_applied} "
+                f"persona_review_written={persona_review_written} "
+                f"session_updates_written={session_updates_written} "
+                f"processed_messages={len(raw_chat_records) if isinstance(raw_chat_records, list) else 0} "
+                f"filtered_messages={len(newly_created_memories)} "
+                f"degraded_mode={degraded_mode} reason={degraded_reason}"
             )
 
         except Exception as e:

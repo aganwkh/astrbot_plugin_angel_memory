@@ -45,13 +45,45 @@ class QueryProcessor:
         diagnostic = {
             "exists": raw_context is not None,
             "angelheart_context_type": context_type,
+            "context_source": "angelheart_context",
             "parse_mode": "",
             "parse_error": "",
             "parsed_type": "",
+            "fallback_used": False,
         }
 
         if raw_context is None:
-            diagnostic["parse_mode"] = "missing"
+            fallback_context = getattr(event, "angelmemory_context", None)
+            fallback_type = type(fallback_context).__name__
+            if fallback_context is None:
+                diagnostic["parse_mode"] = "missing"
+                return {}, diagnostic
+
+            diagnostic["fallback_used"] = True
+            diagnostic["context_source"] = "angelmemory_context"
+            diagnostic["angelheart_context_type"] = fallback_type
+            if isinstance(fallback_context, dict):
+                diagnostic["parse_mode"] = "dict_fallback"
+                diagnostic["parsed_type"] = "dict"
+                return fallback_context, diagnostic
+            if isinstance(fallback_context, str):
+                if not fallback_context.strip():
+                    diagnostic["parse_mode"] = "empty_str"
+                    return {}, diagnostic
+                try:
+                    parsed = json.loads(fallback_context)
+                except (json.JSONDecodeError, TypeError) as e:
+                    diagnostic["parse_mode"] = "json_error"
+                    diagnostic["parse_error"] = str(e)
+                    return {}, diagnostic
+                diagnostic["parse_mode"] = "json_str_fallback"
+                diagnostic["parsed_type"] = type(parsed).__name__
+                if isinstance(parsed, dict):
+                    return parsed, diagnostic
+                diagnostic["parse_mode"] = "non_dict_json"
+                return {}, diagnostic
+
+            diagnostic["parse_mode"] = "unsupported"
             return {}, diagnostic
 
         if isinstance(raw_context, dict):
@@ -325,6 +357,8 @@ class QueryProcessor:
                 "assistant_filter_applied": bool(assistant_names),
                 "preprocess_skipped": preprocess_skipped,
                 "context_parse_mode": secretary_diagnostic.get("parse_mode", ""),
+                "context_source": secretary_diagnostic.get("context_source", ""),
+                "fallback_used": secretary_diagnostic.get("fallback_used", False),
                 "secretary_decision_exists": secretary_diagnostic.get(
                     "secretary_decision_exists",
                     False,

@@ -64,6 +64,12 @@ class BaseMemory:
         useful_score: float = 0.0,
         last_recalled_at: float = 0.0,
         source_message_ids: List[str] | None = None,
+        source_message_roles: List[str] | None = None,
+        source_message_senders: List[dict] | None = None,
+        source_message_is_bot: bool = False,
+        primary_speaker_role: str = "",
+        secondary_speaker_role: str = "",
+        memory_perspective: str = "",
         source_start_ts: float = 0.0,
         source_end_ts: float = 0.0,
         event_start_ts: float = 0.0,
@@ -109,6 +115,20 @@ class BaseMemory:
         self.event_time_confidence = str(
             time_metadata.get("event_time_confidence", TIME_CONFIDENCE_LOW) or TIME_CONFIDENCE_LOW
         )
+        self.source_message_roles = [
+            str(role).strip()
+            for role in self._parse_json_list(source_message_roles)
+            if str(role or "").strip()
+        ]
+        self.source_message_senders = [
+            sender
+            for sender in self._parse_json_list(source_message_senders)
+            if isinstance(sender, dict)
+        ]
+        self.source_message_is_bot = bool(source_message_is_bot)
+        self.primary_speaker_role = str(primary_speaker_role or "").strip()
+        self.secondary_speaker_role = str(secondary_speaker_role or "").strip()
+        self.memory_perspective = str(memory_perspective or "").strip()
 
     def get_semantic_core(self) -> str:
         tags_text = KNOWLEDGE_CORE_SEPARATOR.join(self.tags)
@@ -131,6 +151,12 @@ class BaseMemory:
             "state_snapshot": json.dumps(self.state_snapshot) if self.state_snapshot else "{}",
             "memory_scope": self.memory_scope,
             "source_message_ids": json.dumps(self.source_message_ids, ensure_ascii=False),
+            "source_message_roles": json.dumps(self.source_message_roles, ensure_ascii=False),
+            "source_message_senders": json.dumps(self.source_message_senders, ensure_ascii=False),
+            "source_message_is_bot": int(bool(self.source_message_is_bot)),
+            "primary_speaker_role": self.primary_speaker_role,
+            "secondary_speaker_role": self.secondary_speaker_role,
+            "memory_perspective": self.memory_perspective,
             "source_start_ts": self.source_start_ts,
             "source_end_ts": self.source_end_ts,
             "event_start_ts": self.event_start_ts,
@@ -149,6 +175,18 @@ class BaseMemory:
         if isinstance(data, dict):
             return data
         return {}
+
+    @staticmethod
+    def _parse_json_list(data) -> List[Any]:
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+                return parsed if isinstance(parsed, list) else []
+            except (json.JSONDecodeError, ValueError):
+                return []
+        if isinstance(data, list):
+            return data
+        return []
 
     @staticmethod
     def _parse_tags(tags_data) -> List[str]:
@@ -193,6 +231,12 @@ class BaseMemory:
                 useful_score=data.get("useful_score", 0.0),
                 last_recalled_at=data.get("last_recalled_at", 0.0),
                 source_message_ids=data.get("source_message_ids", []),
+                source_message_roles=cls._parse_json_list(data.get("source_message_roles", [])),
+                source_message_senders=cls._parse_json_list(data.get("source_message_senders", [])),
+                source_message_is_bot=bool(data.get("source_message_is_bot", False)),
+                primary_speaker_role=data.get("primary_speaker_role", ""),
+                secondary_speaker_role=data.get("secondary_speaker_role", ""),
+                memory_perspective=data.get("memory_perspective", ""),
                 source_start_ts=data.get("source_start_ts", 0.0),
                 source_end_ts=data.get("source_end_ts", 0.0),
                 event_start_ts=data.get("event_start_ts", 0.0),

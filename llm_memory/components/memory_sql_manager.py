@@ -108,6 +108,12 @@ class MemorySqlManager:
                     last_decay_at REAL NOT NULL DEFAULT 0,
                     memory_scope TEXT NOT NULL,
                     source_message_ids TEXT NOT NULL DEFAULT '[]',
+                    source_message_roles TEXT NOT NULL DEFAULT '[]',
+                    source_message_senders TEXT NOT NULL DEFAULT '[]',
+                    source_message_is_bot INTEGER NOT NULL DEFAULT 0,
+                    primary_speaker_role TEXT NOT NULL DEFAULT '',
+                    secondary_speaker_role TEXT NOT NULL DEFAULT '',
+                    memory_perspective TEXT NOT NULL DEFAULT '',
                     source_start_ts REAL NOT NULL DEFAULT 0,
                     source_end_ts REAL NOT NULL DEFAULT 0,
                     event_start_ts REAL NOT NULL DEFAULT 0,
@@ -150,11 +156,7 @@ class MemorySqlManager:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_memory_scope_created_at
-                    ON memory_records(memory_scope, created_at);
-                CREATE INDEX IF NOT EXISTS idx_memory_scope_event_time
-                    ON memory_records(memory_scope, event_start_ts, event_end_ts);
-                CREATE INDEX IF NOT EXISTS idx_memory_scope_source_time
-                    ON memory_records(memory_scope, source_start_ts, source_end_ts);
+                    ON memory_records(memory_scope, created_at);                
                 CREATE INDEX IF NOT EXISTS idx_memory_active_strength
                     ON memory_records(is_active, strength);
                 CREATE INDEX IF NOT EXISTS idx_memory_judgment
@@ -220,6 +222,7 @@ class MemorySqlManager:
             # 兼容迁移：memory_records 补充三档记忆字段
             memory_columns = cur.execute("PRAGMA table_info(memory_records)").fetchall()
             memory_column_names = {str(row[1]) for row in memory_columns}
+            added_memory_columns = []
             if "useful_count" not in memory_column_names:
                 cur.execute(
                     "ALTER TABLE memory_records ADD COLUMN useful_count INTEGER NOT NULL DEFAULT 0"
@@ -239,6 +242,33 @@ class MemorySqlManager:
             if "source_message_ids" not in memory_column_names:
                 cur.execute(
                     "ALTER TABLE memory_records ADD COLUMN source_message_ids TEXT NOT NULL DEFAULT '[]'"
+                )
+                added_memory_columns.append("source_message_ids")
+            if "source_message_roles" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN source_message_roles TEXT NOT NULL DEFAULT '[]'"
+                )
+                added_memory_columns.append("source_message_roles")
+            if "source_message_senders" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN source_message_senders TEXT NOT NULL DEFAULT '[]'"
+                )
+                added_memory_columns.append("source_message_senders")
+            if "source_message_is_bot" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN source_message_is_bot INTEGER NOT NULL DEFAULT 0"
+                )
+            if "primary_speaker_role" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN primary_speaker_role TEXT NOT NULL DEFAULT ''"
+                )
+            if "secondary_speaker_role" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN secondary_speaker_role TEXT NOT NULL DEFAULT ''"
+                )
+            if "memory_perspective" not in memory_column_names:
+                cur.execute(
+                    "ALTER TABLE memory_records ADD COLUMN memory_perspective TEXT NOT NULL DEFAULT ''"
                 )
             if "source_start_ts" not in memory_column_names:
                 cur.execute(
@@ -659,11 +689,108 @@ class MemorySqlManager:
         )
 
     @staticmethod
+    def _normalize_string_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        return []
+
+    @staticmethod
+    def _normalize_sender_list(value: Any) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "") or "").strip()
+            sender_id = str(item.get("sender_id", "") or "").strip()
+            sender_name = str(item.get("sender_name", "") or "").strip()
+            key = (role, sender_id, sender_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(
+                {
+                    "role": role,
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                }
+            )
+        return normalized
+
+    @classmethod
+    def _build_speaker_metadata(
+        cls,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        judgment: str = "",
+        reasoning: str = "",
+    ) -> Dict[str, Any]:
+        data = metadata if isinstance(metadata, dict) else {}
+        source_message_roles = cls._normalize_string_list(data.get("source_message_roles", []))
+        source_message_senders = cls._normalize_sender_list(
+            data.get("source_message_senders", [])
+        )
+        source_message_is_bot = bool(
+            data.get("source_message_is_bot", False)
+            or any(role == "assistant" for role in source_message_roles)
+        )
+        primary_speaker_role = str(data.get("primary_speaker_role", "") or "").strip()
+        secondary_speaker_role = str(data.get("secondary_speaker_role", "") or "").strip()
+        memory_perspective = str(data.get("memory_perspective", "") or "").strip()
+
+        if not source_message_roles and source_message_senders:
+            source_message_roles = [
+                str(item.get("role", "") or "").strip()
+                for item in source_message_senders
+                if str(item.get("role", "") or "").strip()
+            ]
+
+        if not primary_speaker_role and source_message_roles:
+            primary_speaker_role = source_message_roles[0]
+        if not secondary_speaker_role and len(source_message_roles) > 1:
+            for role in source_message_roles[1:]:
+                if role != primary_speaker_role:
+                    secondary_speaker_role = role
+                    break
+
+        if not memory_perspective:
+            if primary_speaker_role == "assistant" and not secondary_speaker_role:
+                memory_perspective = "assistant_said"
+            elif primary_speaker_role == "user" and not secondary_speaker_role:
+                memory_perspective = "user_fact"
+            elif source_message_is_bot and "user" in set(source_message_roles):
+                memory_perspective = "shared_dialogue"
+            elif primary_speaker_role == "assistant":
+                memory_perspective = "assistant_said"
+            elif primary_speaker_role == "user":
+                memory_perspective = "user_said"
+            else:
+                memory_perspective = "shared_dialogue"
+
+        return {
+            "source_message_roles": source_message_roles,
+            "source_message_senders": source_message_senders,
+            "source_message_is_bot": source_message_is_bot,
+            "primary_speaker_role": primary_speaker_role,
+            "secondary_speaker_role": secondary_speaker_role,
+            "memory_perspective": memory_perspective,
+            "source_message_count": len(source_message_roles),
+            "memory_summary_label": f"{primary_speaker_role}:{memory_perspective}",
+        }
+
+    @staticmethod
     def _select_memory_columns_sql() -> str:
         return """
             id, memory_type, judgment, reasoning, strength,
             is_active, useful_count, useful_score, last_recalled_at,
             memory_scope, created_at, source_message_ids,
+            source_message_roles, source_message_senders, source_message_is_bot,
+            primary_speaker_role, secondary_speaker_role, memory_perspective,
             source_start_ts, source_end_ts,
             event_start_ts, event_end_ts, event_time_confidence
         """
@@ -867,6 +994,16 @@ class MemorySqlManager:
             useful_score=float(_v("useful_score", 0.0) or 0.0),
             last_recalled_at=float(_v("last_recalled_at", 0.0) or 0.0),
             source_message_ids=normalize_source_message_ids(_v("source_message_ids", "[]")),
+            source_message_roles=MemorySqlManager._normalize_string_list(
+                _v("source_message_roles", "[]")
+            ),
+            source_message_senders=MemorySqlManager._normalize_sender_list(
+                _v("source_message_senders", "[]")
+            ),
+            source_message_is_bot=bool(_v("source_message_is_bot", 0) or False),
+            primary_speaker_role=str(_v("primary_speaker_role", "") or ""),
+            secondary_speaker_role=str(_v("secondary_speaker_role", "") or ""),
+            memory_perspective=str(_v("memory_perspective", "") or ""),
             source_start_ts=float(_v("source_start_ts", 0.0) or 0.0),
             source_end_ts=float(_v("source_end_ts", 0.0) or 0.0),
             event_start_ts=float(_v("event_start_ts", 0.0) or 0.0),
@@ -1599,6 +1736,11 @@ class MemorySqlManager:
             judgment=str(judgment or "").strip(),
             reasoning=str(reasoning or "").strip(),
         )
+        resolved_speaker_metadata = self._build_speaker_metadata(
+            time_metadata,
+            judgment=str(judgment or "").strip(),
+            reasoning=str(reasoning or "").strip(),
+        )
         memory = BaseMemory(
             memory_type=self._to_memory_type(memory_type),
             judgment=str(judgment or "").strip(),
@@ -1617,6 +1759,12 @@ class MemorySqlManager:
             useful_score=0.0,
             last_recalled_at=0.0,
             source_message_ids=resolved_time_metadata.get("source_message_ids", []),
+            source_message_roles=resolved_speaker_metadata.get("source_message_roles", []),
+            source_message_senders=resolved_speaker_metadata.get("source_message_senders", []),
+            source_message_is_bot=bool(resolved_speaker_metadata.get("source_message_is_bot", False)),
+            primary_speaker_role=str(resolved_speaker_metadata.get("primary_speaker_role", "") or ""),
+            secondary_speaker_role=str(resolved_speaker_metadata.get("secondary_speaker_role", "") or ""),
+            memory_perspective=str(resolved_speaker_metadata.get("memory_perspective", "") or ""),
             source_start_ts=resolved_time_metadata.get("source_start_ts", 0.0),
             source_end_ts=resolved_time_metadata.get("source_end_ts", 0.0),
             event_start_ts=resolved_time_metadata.get("event_start_ts", 0.0),
@@ -1633,10 +1781,12 @@ class MemorySqlManager:
                 INSERT INTO memory_records(
                     id, memory_type, judgment, reasoning, strength, is_active,
                     useful_count, useful_score, last_recalled_at,
-                    memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                    memory_scope, source_message_ids, source_message_roles, source_message_senders,
+                    source_message_is_bot, primary_speaker_role, secondary_speaker_role, memory_perspective,
+                    source_start_ts, source_end_ts,
                     event_start_ts, event_end_ts, event_time_confidence,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory.id,
@@ -1650,6 +1800,12 @@ class MemorySqlManager:
                     memory.last_recalled_at,
                     scope,
                     json.dumps(memory.source_message_ids, ensure_ascii=False),
+                    json.dumps(memory.source_message_roles, ensure_ascii=False),
+                    json.dumps(memory.source_message_senders, ensure_ascii=False),
+                    1 if bool(memory.source_message_is_bot) else 0,
+                    memory.primary_speaker_role,
+                    memory.secondary_speaker_role,
+                    memory.memory_perspective,
                     memory.source_start_ts,
                     memory.source_end_ts,
                     memory.event_start_ts,
@@ -1684,6 +1840,18 @@ class MemorySqlManager:
             judgment=str(getattr(memory, "judgment", "") or "").strip(),
             reasoning=str(getattr(memory, "reasoning", "") or "").strip(),
         )
+        resolved_speaker_metadata = self._build_speaker_metadata(
+            {
+                "source_message_roles": getattr(memory, "source_message_roles", []),
+                "source_message_senders": getattr(memory, "source_message_senders", []),
+                "source_message_is_bot": getattr(memory, "source_message_is_bot", False),
+                "primary_speaker_role": getattr(memory, "primary_speaker_role", ""),
+                "secondary_speaker_role": getattr(memory, "secondary_speaker_role", ""),
+                "memory_perspective": getattr(memory, "memory_perspective", ""),
+            },
+            judgment=str(getattr(memory, "judgment", "") or "").strip(),
+            reasoning=str(getattr(memory, "reasoning", "") or "").strip(),
+        )
         memory_type = getattr(getattr(memory, "memory_type", None), "value", None)
         if not memory_type:
             memory_type = "知识记忆"
@@ -1694,10 +1862,12 @@ class MemorySqlManager:
                 INSERT INTO memory_records(
                     id, memory_type, judgment, reasoning, strength, is_active,
                     useful_count, useful_score, last_recalled_at,
-                    memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                    memory_scope, source_message_ids, source_message_roles, source_message_senders,
+                    source_message_is_bot, primary_speaker_role, secondary_speaker_role, memory_perspective,
+                    source_start_ts, source_end_ts,
                     event_start_ts, event_end_ts, event_time_confidence,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     memory_type=excluded.memory_type,
                     judgment=excluded.judgment,
@@ -1709,6 +1879,12 @@ class MemorySqlManager:
                     last_recalled_at=excluded.last_recalled_at,
                     memory_scope=excluded.memory_scope,
                     source_message_ids=excluded.source_message_ids,
+                    source_message_roles=excluded.source_message_roles,
+                    source_message_senders=excluded.source_message_senders,
+                    source_message_is_bot=excluded.source_message_is_bot,
+                    primary_speaker_role=excluded.primary_speaker_role,
+                    secondary_speaker_role=excluded.secondary_speaker_role,
+                    memory_perspective=excluded.memory_perspective,
                     source_start_ts=excluded.source_start_ts,
                     source_end_ts=excluded.source_end_ts,
                     event_start_ts=excluded.event_start_ts,
@@ -1734,6 +1910,12 @@ class MemorySqlManager:
                         ),
                         ensure_ascii=False,
                     ),
+                    json.dumps(resolved_speaker_metadata.get("source_message_roles", []), ensure_ascii=False),
+                    json.dumps(resolved_speaker_metadata.get("source_message_senders", []), ensure_ascii=False),
+                    1 if bool(resolved_speaker_metadata.get("source_message_is_bot", False)) else 0,
+                    str(resolved_speaker_metadata.get("primary_speaker_role", "") or ""),
+                    str(resolved_speaker_metadata.get("secondary_speaker_role", "") or ""),
+                    str(resolved_speaker_metadata.get("memory_perspective", "") or ""),
                     float(resolved_time_metadata.get("source_start_ts", 0.0) or 0.0),
                     float(resolved_time_metadata.get("source_end_ts", 0.0) or 0.0),
                     float(resolved_time_metadata.get("event_start_ts", 0.0) or 0.0),
@@ -1836,6 +2018,12 @@ class MemorySqlManager:
                                     last_recalled_at = ?,
                                     memory_scope = ?,
                                     source_message_ids = ?,
+                                    source_message_roles = ?,
+                                    source_message_senders = ?,
+                                    source_message_is_bot = ?,
+                                    primary_speaker_role = ?,
+                                    secondary_speaker_role = ?,
+                                    memory_perspective = ?,
                                     source_start_ts = ?,
                                     source_end_ts = ?,
                                     event_start_ts = ?,
@@ -1860,6 +2048,12 @@ class MemorySqlManager:
                                         ),
                                         ensure_ascii=False,
                                     ),
+                                    json.dumps(resolved_speaker_metadata.get("source_message_roles", []), ensure_ascii=False),
+                                    json.dumps(resolved_speaker_metadata.get("source_message_senders", []), ensure_ascii=False),
+                                    1 if bool(resolved_speaker_metadata.get("source_message_is_bot", False)) else 0,
+                                    str(resolved_speaker_metadata.get("primary_speaker_role", "") or ""),
+                                    str(resolved_speaker_metadata.get("secondary_speaker_role", "") or ""),
+                                    str(resolved_speaker_metadata.get("memory_perspective", "") or ""),
                                     float(resolved_time_metadata.get("source_start_ts", 0.0) or 0.0),
                                     float(resolved_time_metadata.get("source_end_ts", 0.0) or 0.0),
                                     float(resolved_time_metadata.get("event_start_ts", 0.0) or 0.0),
@@ -1900,10 +2094,12 @@ class MemorySqlManager:
                             INSERT INTO memory_records(
                                 id, memory_type, judgment, reasoning, strength, is_active,
                                 useful_count, useful_score, last_recalled_at,
-                                memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                                memory_scope, source_message_ids, source_message_roles, source_message_senders,
+                                source_message_is_bot, primary_speaker_role, secondary_speaker_role, memory_perspective,
+                                source_start_ts, source_end_ts,
                                 event_start_ts, event_end_ts, event_time_confidence,
                                 created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 memory_id,
@@ -1922,6 +2118,12 @@ class MemorySqlManager:
                                     ),
                                     ensure_ascii=False,
                                 ),
+                                json.dumps(resolved_speaker_metadata.get("source_message_roles", []), ensure_ascii=False),
+                                json.dumps(resolved_speaker_metadata.get("source_message_senders", []), ensure_ascii=False),
+                                1 if bool(resolved_speaker_metadata.get("source_message_is_bot", False)) else 0,
+                                str(resolved_speaker_metadata.get("primary_speaker_role", "") or ""),
+                                str(resolved_speaker_metadata.get("secondary_speaker_role", "") or ""),
+                                str(resolved_speaker_metadata.get("memory_perspective", "") or ""),
                                 float(resolved_time_metadata.get("source_start_ts", 0.0) or 0.0),
                                 float(resolved_time_metadata.get("source_end_ts", 0.0) or 0.0),
                                 float(resolved_time_metadata.get("event_start_ts", 0.0) or 0.0),
@@ -2578,6 +2780,46 @@ class MemorySqlManager:
                 merged_event_confidence = TIME_CONFIDENCE_INFERRED
             elif merged_source_start_ts > 0:
                 merged_event_confidence = TIME_CONFIDENCE_EXACT
+        merged_source_roles: List[str] = []
+        merged_source_senders: List[Dict[str, Any]] = []
+        seen_senders = set()
+        for mem in memories:
+            for role in self._normalize_string_list(getattr(mem, "source_message_roles", [])):
+                if role not in merged_source_roles:
+                    merged_source_roles.append(role)
+            for sender in self._normalize_sender_list(getattr(mem, "source_message_senders", [])):
+                sender_key = (
+                    str(sender.get("role", "") or ""),
+                    str(sender.get("sender_id", "") or ""),
+                    str(sender.get("sender_name", "") or ""),
+                )
+                if sender_key in seen_senders:
+                    continue
+                seen_senders.add(sender_key)
+                merged_source_senders.append(sender)
+        merged_source_is_bot = any(
+            bool(getattr(mem, "source_message_is_bot", False)) for mem in memories
+        ) or any(role == "assistant" for role in merged_source_roles)
+        merged_primary_role = merged_source_roles[0] if merged_source_roles else ""
+        merged_secondary_role = ""
+        for role in merged_source_roles[1:]:
+            if role != merged_primary_role:
+                merged_secondary_role = role
+                break
+        merged_memory_perspective = str(getattr(first, "memory_perspective", "") or "").strip()
+        if not merged_memory_perspective:
+            if merged_primary_role == "assistant" and not merged_secondary_role:
+                merged_memory_perspective = "assistant_said"
+            elif merged_primary_role == "user" and not merged_secondary_role:
+                merged_memory_perspective = "user_fact"
+            elif merged_source_is_bot and "user" in set(merged_source_roles):
+                merged_memory_perspective = "shared_dialogue"
+            elif merged_primary_role == "assistant":
+                merged_memory_perspective = "assistant_said"
+            elif merged_primary_role == "user":
+                merged_memory_perspective = "user_said"
+            else:
+                merged_memory_perspective = "shared_dialogue"
         now = time.time()
         new_memory = BaseMemory(
             memory_type=self._to_memory_type("knowledge"),
@@ -2593,6 +2835,12 @@ class MemorySqlManager:
             useful_score=merged_useful_score,
             last_recalled_at=merged_last_recalled_at,
             source_message_ids=merged_source_message_ids,
+            source_message_roles=merged_source_roles,
+            source_message_senders=merged_source_senders,
+            source_message_is_bot=merged_source_is_bot,
+            primary_speaker_role=merged_primary_role,
+            secondary_speaker_role=merged_secondary_role,
+            memory_perspective=merged_memory_perspective,
             source_start_ts=merged_source_start_ts,
             source_end_ts=merged_source_end_ts,
             event_start_ts=merged_event_start_ts,
@@ -2611,10 +2859,12 @@ class MemorySqlManager:
                     INSERT INTO memory_records(
                         id, memory_type, judgment, reasoning, strength, is_active,
                         useful_count, useful_score, last_recalled_at,
-                        memory_scope, source_message_ids, source_start_ts, source_end_ts,
+                        memory_scope, source_message_ids, source_message_roles, source_message_senders,
+                        source_message_is_bot, primary_speaker_role, secondary_speaker_role, memory_perspective,
+                        source_start_ts, source_end_ts,
                         event_start_ts, event_end_ts, event_time_confidence,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_memory.id,
@@ -2628,6 +2878,12 @@ class MemorySqlManager:
                         new_memory.last_recalled_at,
                         new_memory.memory_scope,
                         json.dumps(new_memory.source_message_ids, ensure_ascii=False),
+                        json.dumps(new_memory.source_message_roles, ensure_ascii=False),
+                        json.dumps(new_memory.source_message_senders, ensure_ascii=False),
+                        1 if bool(new_memory.source_message_is_bot) else 0,
+                        new_memory.primary_speaker_role,
+                        new_memory.secondary_speaker_role,
+                        new_memory.memory_perspective,
                         new_memory.source_start_ts,
                         new_memory.source_end_ts,
                         new_memory.event_start_ts,
