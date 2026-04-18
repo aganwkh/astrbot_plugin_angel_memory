@@ -80,6 +80,20 @@ class SimpleMemoryRuntime:
             time_filter=time_filter,
         )
 
+    async def list_memories_in_time_window(
+        self,
+        memory_scope: str,
+        time_filter: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+        sort_order: str = "asc",
+    ) -> List[BaseMemory]:
+        return await self._manager.list_memories_in_time_window(
+            memory_scope=memory_scope,
+            time_filter=time_filter,
+            limit=limit,
+            sort_order=sort_order,
+        )
+
     async def chained_recall(
         self,
         query: str,

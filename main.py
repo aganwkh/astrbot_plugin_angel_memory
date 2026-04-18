@@ -13,8 +13,10 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 import asyncio
 from datetime import datetime
+import hashlib
 import json
 import logging
+import time
 
 try:
     from astrbot.api import logger
@@ -32,11 +34,20 @@ from .tools.note_recall import NoteRecallTool
 from .tools.research_tool import ResearchTool
 from .core.utils.time_diagnostics import (
     analyze_recall_request,
+    analyze_time_slot_classifier_trigger,
     analyze_time_intent,
+    build_time_intent_from_slot,
     build_time_filter_payload,
     get_event_diagnostic_store,
+    get_legal_time_slot_names,
+    get_time_slot_catalog_for_prompt,
+    is_low_information_followup,
+    is_recall_or_review_query,
+    parse_time_slot_selection_response,
     preview_text,
     summarize_raw_chat_rows,
+    TIME_SLOT_CACHE_TTL_SECONDS,
+    TIME_SLOT_CONFIDENCE_THRESHOLD,
 )
 
 
@@ -62,7 +73,7 @@ def configure_logging_behavior():
     "astrbot_plugin_angel_memory",
     "kawayiYokami",
     "天使的记忆，让astrbot拥有记忆维护系统和开箱即用的知识库检索",
-    "1.4.2",
+    "1.4.8",
     "https://github.com/kawayiYokami/astrbot_plugin_angel_memory"
 )
 class AngelMemoryPlugin(Star):
@@ -107,6 +118,7 @@ class AngelMemoryPlugin(Star):
         self._conversation_id_logged_once: set[str] = set()
         self._background_tasks: set[asyncio.Task] = set()
         self._is_terminating: bool = False
+        self._time_slot_followup_cache: dict[tuple[str, str, str], dict] = {}
 
         # 3. 在主线程获取完整配置（包含提供商信息）
         self._load_complete_config()
@@ -167,7 +179,7 @@ class AngelMemoryPlugin(Star):
     def _fetch_raw_chat_records(
         self,
         session_id: str,
-        limit: int = 15,
+        limit: int | None = 15,
         start_ts: float | None = None,
         end_ts: float | None = None,
         role: str | None = None,
@@ -187,16 +199,17 @@ class AngelMemoryPlugin(Star):
             if role:
                 conditions.append("role = ?")
                 params.append(str(role))
-            cursor.execute(
-                f"""
+            query = f"""
                 SELECT role, content, timestamp
                 FROM chat_window
                 WHERE {' AND '.join(conditions)}
                 ORDER BY timestamp DESC, id DESC
-                LIMIT ?
-                """,
-                (*params, int(limit)),
-            )
+            """
+            if limit is not None and int(limit) > 0:
+                query += "\nLIMIT ?"
+                cursor.execute(query, (*params, int(limit)))
+            else:
+                cursor.execute(query, tuple(params))
             rows = cursor.fetchall()
 
         rows.reverse()
@@ -262,6 +275,504 @@ class AngelMemoryPlugin(Star):
             or getattr(event, "message_str", "")
             or ""
         ).strip()
+
+    @staticmethod
+    def _classification_scope_label(recall_request: dict) -> str:
+        if not isinstance(recall_request, dict):
+            return "generic"
+        if bool(recall_request.get("raw_chat_priority")):
+            return "raw_chat"
+        return "memory_recall"
+
+    @staticmethod
+    def _is_contextual_time_slot(normalized_time_range: str) -> bool:
+        return str(normalized_time_range or "").strip() in {
+            "just_now",
+            "recent_context",
+            "earlier_context",
+            "last_time",
+        }
+
+    @staticmethod
+    def _should_restrict_raw_chat_only(
+        normalized_time_range: str,
+        recall_request: dict,
+    ) -> bool:
+        matched_phrases = list((recall_request or {}).get("matched_phrases", []) or [])
+        exact_phrase_hits = {
+            "\u539f\u8bdd",
+            "\u539f\u53e5",
+            "\u8bf4\u4e86\u4ec0\u4e48",
+            "\u8bf4\u8fc7\u4ec0\u4e48",
+            "\u8bf4\u7684\u4ec0\u4e48",
+            "\u8bf4\u4e86\u5565",
+        }
+        return bool(
+            ((recall_request or {}).get("raw_chat_priority") or AngelMemoryPlugin._is_contextual_time_slot(normalized_time_range))
+            and (
+                AngelMemoryPlugin._is_contextual_time_slot(normalized_time_range)
+                or any(phrase in exact_phrase_hits for phrase in matched_phrases)
+            )
+        )
+
+    async def _resolve_time_classifier_provider(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[str, object | None]:
+        session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        provider_id = str(self.plugin_context.get_llm_provider_id() or "").strip()
+        if not provider_id and hasattr(self.context, "get_current_chat_provider_id"):
+            try:
+                provider_id = str(
+                    await self.context.get_current_chat_provider_id(umo=session_id)
+                    or ""
+                ).strip()
+            except Exception as exc:
+                self.logger.debug(f"[时间槽分类] 获取当前会话 provider_id 失败: {exc}")
+
+        if not provider_id or not hasattr(self.context, "get_provider_by_id"):
+            return "", None
+
+        try:
+            return provider_id, self.context.get_provider_by_id(provider_id)
+        except Exception as exc:
+            self.logger.warning(
+                f"[时间槽分类] 解析 provider 失败 provider_id={provider_id} error={exc}"
+            )
+            return provider_id, None
+
+    async def _resolve_time_slot_cache_scope(
+        self,
+        event: AstrMessageEvent,
+    ) -> str:
+        try:
+            scope_name = await self.plugin_context.resolve_memory_scope_from_event(event)
+            return str(scope_name or "").strip() or "public"
+        except Exception:
+            return "public"
+
+    @staticmethod
+    def _make_time_slot_followup_cache_key(
+        session_id: str,
+        scope_name: str,
+        classification_scope: str,
+    ) -> tuple[str, str, str]:
+        return (
+            str(session_id or "").strip(),
+            str(scope_name or "").strip() or "public",
+            str(classification_scope or "").strip() or "generic",
+        )
+
+    def _prune_time_slot_followup_cache(self) -> None:
+        now_ts = time.time()
+        expired_keys = [
+            cache_key
+            for cache_key, payload in self._time_slot_followup_cache.items()
+            if now_ts - float(payload.get("cached_at", 0.0) or 0.0)
+            > float(TIME_SLOT_CACHE_TTL_SECONDS)
+        ]
+        for cache_key in expired_keys:
+            self._time_slot_followup_cache.pop(cache_key, None)
+
+    def _get_time_slot_followup_cache_entry(
+        self,
+        session_id: str,
+        scope_name: str,
+        classification_scope: str,
+    ) -> dict | None:
+        self._prune_time_slot_followup_cache()
+        candidate_keys = [
+            self._make_time_slot_followup_cache_key(
+                session_id,
+                scope_name,
+                classification_scope,
+            )
+        ]
+        if classification_scope == "generic":
+            candidate_keys.extend(
+                [
+                    self._make_time_slot_followup_cache_key(session_id, scope_name, "raw_chat"),
+                    self._make_time_slot_followup_cache_key(session_id, scope_name, "memory_recall"),
+                ]
+            )
+
+        candidates: list[dict] = []
+        for cache_key in candidate_keys:
+            payload = self._time_slot_followup_cache.get(cache_key)
+            if isinstance(payload, dict):
+                candidates.append(payload)
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: float(item.get("cached_at", 0.0) or 0.0), reverse=True)
+        return candidates[0]
+
+    def _store_time_slot_followup_cache(
+        self,
+        session_id: str,
+        scope_name: str,
+        classification_scope: str,
+        time_intent: dict,
+        time_filter: dict,
+        source_text: str,
+    ) -> None:
+        normalized_time_range = str(time_intent.get("normalized_time_range", "") or "").strip()
+        if not normalized_time_range or not bool(time_filter.get("matched")):
+            return
+
+        cache_key = self._make_time_slot_followup_cache_key(
+            session_id,
+            scope_name,
+            classification_scope,
+        )
+        self._time_slot_followup_cache[cache_key] = {
+            "cached_at": time.time(),
+            "session_id": session_id,
+            "scope_name": scope_name,
+            "classification_scope": classification_scope,
+            "normalized_time_range": normalized_time_range,
+            "time_intent": dict(time_intent or {}),
+            "time_filter": dict(time_filter or {}),
+            "source_text_preview": preview_text(source_text, 120),
+            "source_text_hash": hashlib.sha1(str(source_text or "").encode("utf-8")).hexdigest(),
+        }
+
+    def _build_time_slot_classification_prompt(
+        self,
+        message_text: str,
+        context_rows: list[tuple[str, str, float]],
+        timezone_name: str,
+        legal_slots: list[str],
+        previous_slot: str,
+        now_text: str,
+    ) -> str:
+        context_lines = []
+        for role, content, timestamp in context_rows[-8:]:
+            context_lines.append(
+                {
+                    "time": self._format_raw_chat_timestamp(timestamp),
+                    "role": str(role or "").strip(),
+                    "content": preview_text(str(content or "").strip(), 80),
+                }
+            )
+
+        slot_catalog = get_time_slot_catalog_for_prompt(timezone_name=timezone_name)
+        payload = {
+            "role": "You are a time-slot classifier, not a chat assistant.",
+            "task": "Judge which existing time slot should be used for downstream dialogue retrieval.",
+            "timezone": timezone_name,
+            "now": now_text,
+            "current_user_input": str(message_text or ""),
+            "recent_context": context_lines,
+            "previous_selected_time_slot": str(previous_slot or ""),
+            "legal_time_slots": legal_slots,
+            "time_slot_catalog": slot_catalog,
+            "classification_method": [
+                "Step 1: infer relative-date semantics such as today, yesterday, last week, rolling recent period, or contextual follow-up.",
+                "Step 2: infer time-of-day semantics such as early morning, morning, noon, afternoon, night, all-day, or contextual chat scope.",
+                "Step 3: map the combined semantics to exactly one legal slot by semantic definition, representative examples, and adjacent boundaries.",
+            ],
+            "decision_rules": [
+                "If the user clearly points to 今天凌晨 or 凌晨那会儿, prefer early_morning.",
+                "If the user clearly points to 昨天凌晨, prefer yesterday_early_morning.",
+                "If the user clearly points to 刚才 or 刚刚, prefer just_now.",
+                "If the user clearly points to 上周一到上周日, map to last_weekday_0 through last_weekday_6.",
+                "For low-information follow-ups such as 都聊了些什么, 那次呢, 前面那个呢, if previous_selected_time_slot is available, prefer inherit_previous.",
+                "If information is insufficient, choose abstain and do not guess.",
+                "Do not output time ranges and do not answer the user question.",
+                "Do not choose by slot_name wording similarity.",
+            ],
+            "few_shots": [
+                {
+                    "input": "我们今天凌晨都聊了些什么？",
+                    "output": {
+                        "decision": "selected_time_slot",
+                        "selected_time_slot": "early_morning",
+                        "reason": "明确指向今天凌晨",
+                    },
+                },
+                {
+                    "input": "对了，我们今天凌晨聊了啥来着？",
+                    "output": {
+                        "decision": "selected_time_slot",
+                        "selected_time_slot": "early_morning",
+                        "reason": "明确指向今天凌晨",
+                    },
+                },
+                {
+                    "input": "昨天凌晨那会儿说了什么？",
+                    "output": {
+                        "decision": "selected_time_slot",
+                        "selected_time_slot": "yesterday_early_morning",
+                        "reason": "明确指向昨天凌晨",
+                    },
+                },
+                {
+                    "input": "刚才说到哪了？",
+                    "output": {
+                        "decision": "selected_time_slot",
+                        "selected_time_slot": "just_now",
+                        "reason": "近距离时间回指",
+                    },
+                },
+                {
+                    "input": "都聊了些什么？",
+                    "output": {
+                        "decision": "inherit_previous",
+                        "selected_time_slot": "",
+                        "reason": "低信息跟进，应继承上一轮时间槽",
+                    },
+                },
+                {
+                    "input": "之前提过吗？",
+                    "output": {
+                        "decision": "abstain",
+                        "selected_time_slot": "",
+                        "reason": "时间范围过模糊，无法稳定落槽",
+                    },
+                },
+            ],
+            "output_schema": {
+                "decision": "selected_time_slot | abstain | inherit_previous",
+                "selected_time_slot": "",
+                "reason": "",
+            },
+            "rules": [
+                "You must only choose from legal_time_slots.",
+                "Do not invent new slot names.",
+                "Return strict JSON only with no markdown fence.",
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def _resolve_final_time_intent(
+        self,
+        event: AstrMessageEvent,
+        message_text: str,
+    ) -> tuple[dict, dict, dict]:
+        diagnostic_store = get_event_diagnostic_store(event)
+        timezone_name = "Asia/Shanghai"
+        empty_intent = build_time_intent_from_slot("", timezone_name=timezone_name).to_dict()
+        empty_time_filter = build_time_filter_payload("", timezone_name=timezone_name)
+        rule_time_intent = analyze_time_intent(message_text, timezone_name=timezone_name)
+        recall_request = analyze_recall_request(message_text)
+        trigger_payload = analyze_time_slot_classifier_trigger(
+            message_text,
+            recall_request=recall_request,
+            time_intent=rule_time_intent,
+        )
+        low_info_followup = bool(trigger_payload.get("low_information_followup"))
+        recall_or_review = bool(trigger_payload.get("recall_or_review"))
+        should_call_classifier = bool(trigger_payload.get("should_call_classifier"))
+        classification_scope = self._classification_scope_label(recall_request)
+        session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        scope_name = await self._resolve_time_slot_cache_scope(event)
+        previous_cache = self._get_time_slot_followup_cache_entry(
+            session_id,
+            scope_name,
+            classification_scope if not low_info_followup else "generic",
+        )
+        previous_slot = (
+            str(previous_cache.get("normalized_time_range", "") or "").strip()
+            if isinstance(previous_cache, dict)
+            else ""
+        )
+        legal_slots = get_legal_time_slot_names(timezone_name=timezone_name)
+        provider_id, provider = await self._resolve_time_classifier_provider(event)
+        provider_available = provider is not None
+        classification_status = "not_applicable"
+        diagnostic_store["time_slot_trigger"] = {
+            **trigger_payload,
+            "provider_available": provider_available,
+            "provider_id": provider_id,
+            "previous_selected_time_slot": previous_slot,
+            "classification_scope": classification_scope,
+        }
+        self.logger.info(
+            "[时间槽分类][触发判定] payload="
+            f"{json.dumps(diagnostic_store['time_slot_trigger'], ensure_ascii=False)}"
+        )
+        decision_payload = {
+            "decision": "abstain",
+            "selected_time_slot": "",
+            "confidence": 0.0,
+            "reason": "",
+            "inherit_previous": False,
+            "abstain": True,
+            "parse_success": False,
+            "is_valid_slot": False,
+            "low_confidence": False,
+            "error": "",
+            "provider_available": provider_available,
+            "provider_id": provider_id,
+            "confidence_threshold": float(TIME_SLOT_CONFIDENCE_THRESHOLD),
+            "low_information_followup": low_info_followup,
+            "recall_or_review": recall_or_review,
+            "classification_scope": classification_scope,
+            "previous_selected_time_slot": previous_slot,
+            "cache_ttl_seconds": int(TIME_SLOT_CACHE_TTL_SECONDS),
+            "should_call_classifier": should_call_classifier,
+            "trigger_reason": list(trigger_payload.get("trigger_reason", []) or []),
+        }
+
+        final_time_intent = dict(empty_intent)
+        final_time_filter = dict(empty_time_filter)
+        response_text = ""
+
+        if not should_call_classifier:
+            classification_status = "not_applicable"
+        elif not provider_available:
+            if low_info_followup and isinstance(previous_cache, dict):
+                classification_status = "inherited"
+                final_time_intent = dict(previous_cache.get("time_intent", {}) or {})
+                final_time_filter = dict(previous_cache.get("time_filter", {}) or {})
+                decision_payload.update(
+                    {
+                        "decision": "inherit_previous",
+                        "selected_time_slot": previous_slot,
+                        "reason": "provider_unavailable_followup_inherit",
+                        "inherit_previous": True,
+                        "abstain": False,
+                        "confidence": 1.0,
+                    }
+                )
+            else:
+                classification_status = "provider_unavailable_empty"
+        else:
+            context_rows = []
+            if session_id:
+                try:
+                    context_rows = await asyncio.to_thread(
+                        self._fetch_recent_raw_chat_records,
+                        session_id,
+                        8,
+                    )
+                except Exception as exc:
+                    self.logger.debug(f"[时间槽分类] 读取上下文失败 session={session_id} error={exc}")
+            prompt = self._build_time_slot_classification_prompt(
+                message_text=message_text,
+                context_rows=context_rows,
+                timezone_name=timezone_name,
+                legal_slots=legal_slots,
+                previous_slot=previous_slot,
+                now_text=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            try:
+                llm_response = await provider.text_chat(prompt=prompt)
+                response_text = self._extract_response_text(llm_response)
+            except Exception as exc:
+                response_text = ""
+                decision_payload["error"] = f"classifier_call_failed:{exc}"
+            parsed_result = parse_time_slot_selection_response(
+                response_text=response_text,
+                legal_slots=legal_slots,
+                confidence_threshold=TIME_SLOT_CONFIDENCE_THRESHOLD,
+            )
+            diagnostic_store["time_slot_model_output"] = {
+                "raw_response_original": str(parsed_result.raw_response_original or response_text or ""),
+                "raw_response_sanitized": str(parsed_result.raw_response_sanitized or ""),
+                "extraction_mode": str(parsed_result.extraction_mode or ""),
+                "parse_error": str(parsed_result.parse_error or parsed_result.error or ""),
+                "parsed_result": parsed_result.to_dict(),
+                "parse_success": bool(parsed_result.parse_success),
+            }
+            self.logger.info(
+                "[时间槽分类][模型原始输出] payload="
+                f"{json.dumps(diagnostic_store['time_slot_model_output'], ensure_ascii=False)}"
+            )
+            decision_payload.update(parsed_result.to_dict())
+            if parsed_result.parse_success and parsed_result.inherit_previous:
+                if isinstance(previous_cache, dict):
+                    classification_status = "inherited"
+                    final_time_intent = dict(previous_cache.get("time_intent", {}) or {})
+                    final_time_filter = dict(previous_cache.get("time_filter", {}) or {})
+                    decision_payload.update(
+                        {
+                            "selected_time_slot": previous_slot,
+                            "inherit_previous": True,
+                            "abstain": False,
+                            "confidence": max(float(parsed_result.confidence or 0.0), 1.0),
+                        }
+                    )
+                else:
+                    classification_status = "abstained"
+                    decision_payload["abstain"] = True
+                    decision_payload["error"] = "inherit_previous_without_cache"
+            elif parsed_result.parse_success and not parsed_result.abstain:
+                final_intent_obj = build_time_intent_from_slot(
+                    parsed_result.selected_time_slot,
+                    timezone_name=timezone_name,
+                )
+                mapped_time_filter = build_time_filter_payload(final_intent_obj)
+                if mapped_time_filter.get("matched"):
+                    classification_status = "classified"
+                    final_time_intent = final_intent_obj.to_dict()
+                    final_time_filter = mapped_time_filter
+                else:
+                    classification_status = "abstained"
+                    decision_payload["abstain"] = True
+                    decision_payload["error"] = "mapped_time_filter_unmatched"
+            elif parsed_result.error == "low_confidence":
+                classification_status = "low_confidence_abstained"
+            elif not parsed_result.parse_success:
+                classification_status = "parse_failed_abstained"
+            else:
+                classification_status = "abstained"
+
+            if (
+                bool(decision_payload.get("abstain"))
+                and low_info_followup
+                and isinstance(previous_cache, dict)
+            ):
+                classification_status = "inherited"
+                final_time_intent = dict(previous_cache.get("time_intent", {}) or {})
+                final_time_filter = dict(previous_cache.get("time_filter", {}) or {})
+                decision_payload.update(
+                    {
+                        "decision": "inherit_previous",
+                        "selected_time_slot": previous_slot,
+                        "reason": str(decision_payload.get("reason", "") or "followup_inherit"),
+                        "inherit_previous": True,
+                        "abstain": False,
+                        "confidence": max(float(decision_payload.get("confidence", 0.0) or 0.0), 1.0),
+                    }
+                )
+
+        if final_time_filter.get("matched"):
+            self._store_time_slot_followup_cache(
+                session_id=session_id,
+                scope_name=scope_name,
+                classification_scope=classification_scope,
+                time_intent=final_time_intent,
+                time_filter=final_time_filter,
+                source_text=message_text,
+            )
+
+        diagnostic_store["time_slot_legalization"] = {
+            "decision": str(decision_payload.get("decision", "abstain") or "abstain"),
+            "selected_time_slot": str(decision_payload.get("selected_time_slot", "") or ""),
+            "slot_is_valid": bool(decision_payload.get("is_valid_slot")),
+            "inherited": bool(decision_payload.get("inherit_previous")),
+            "abstained": bool(decision_payload.get("abstain")),
+            "normalized_time_range": str(final_time_intent.get("normalized_time_range", "") or ""),
+            "classification_status": classification_status,
+            "error": str(decision_payload.get("error", "") or ""),
+        }
+        self.logger.info(
+            "[时间槽分类][合法化结果] payload="
+            f"{json.dumps(diagnostic_store['time_slot_legalization'], ensure_ascii=False)}"
+        )
+        decision_payload["classification_status"] = classification_status
+        decision_payload["final_time_intent"] = final_time_intent
+        decision_payload["final_time_filter"] = final_time_filter
+        decision_payload["scope_name"] = scope_name
+        decision_payload["session_id"] = session_id
+        diagnostic_store["time_slot_classification"] = decision_payload
+        self.logger.info(
+            "[时间槽分类结果] payload="
+            f"{json.dumps({'session_id': session_id, 'classification_status': classification_status, 'selected_time_slot': str(decision_payload.get('selected_time_slot', '') or ''), 'confidence': float(decision_payload.get('confidence', 0.0) or 0.0), 'abstain': bool(decision_payload.get('abstain')), 'normalized_time_range': str(final_time_intent.get('normalized_time_range', '') or ''), 'time_filter': final_time_filter}, ensure_ascii=False)}"
+        )
+        return final_time_intent, final_time_filter, recall_request
 
     def _build_raw_chat_anchor(self, rows: list[tuple[str, str, float]]) -> str:
         history_text = "\n".join(
@@ -446,6 +957,7 @@ class AngelMemoryPlugin(Star):
             "recall_request": recall_request,
             "strict_time_recall": strict_time_recall,
             "exact_raw_chat_only": exact_raw_chat_only,
+            "recall_mode": recall_mode,
             "gate_note": "明确时间窗优先于 recall phrase，recall phrase 仅作增强信号。",
         }
         self.logger.info(
@@ -459,7 +971,7 @@ class AngelMemoryPlugin(Star):
                 raw_chat_recall_rows = await asyncio.to_thread(
                     self._fetch_raw_chat_records,
                     session_id,
-                    30,
+                    None,
                     float(time_filter.get("start_ts", 0.0) or 0.0),
                     float(time_filter.get("end_ts", 0.0) or 0.0),
                     None,
@@ -578,6 +1090,213 @@ class AngelMemoryPlugin(Star):
             f"anchor条数={len(rows)} 回顾条数={len(raw_chat_recall_rows)} 近期事实条数={len(recent_user_rows)}"
         )
 
+    async def _inject_recent_raw_chat_anchor_v2(
+        self, event: AstrMessageEvent, request: ProviderRequest
+    ) -> None:
+        session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not session_id:
+            self.logger.debug("[时间槽分类] 跳过，原因=缺少有效 session_id")
+            return
+
+        message_text = self._extract_user_message_text(event)
+        final_time_intent, time_filter, recall_request = await self._resolve_final_time_intent(
+            event,
+            message_text,
+        )
+        rule_time_intent = analyze_time_intent(message_text)
+        normalized_time_range = str(
+            final_time_intent.get("normalized_time_range", "") or ""
+        ).strip()
+        exact_raw_chat_only = self._should_restrict_raw_chat_only(
+            normalized_time_range=normalized_time_range,
+            recall_request=recall_request,
+        )
+        strict_time_recall = bool(time_filter.get("matched"))
+        recall_mode = "time_slot_replay_full" if strict_time_recall else "standard"
+
+        diagnostic_store = get_event_diagnostic_store(event)
+        diagnostic_store["time_intent"] = final_time_intent
+        diagnostic_store["time_intent_rule_preview"] = rule_time_intent.to_dict()
+        diagnostic_store["recall_request"] = recall_request
+        diagnostic_store["time_filter"] = time_filter
+        diagnostic_store["raw_chat_time_recall_gate"] = {
+            "raw_user_input": preview_text(message_text, 160),
+            "time_intent": final_time_intent,
+            "time_intent_rule_preview": rule_time_intent.to_dict(),
+            "time_filter": time_filter,
+            "recall_request": recall_request,
+            "strict_time_recall": strict_time_recall,
+            "exact_raw_chat_only": exact_raw_chat_only,
+            "gate_note": "最终合法时间槽一旦产出，即直接驱动 strict_time_recall 与 time_filter 透传。",
+        }
+        self.logger.info(
+            "[时间过滤诊断][原始聊天门控] payload="
+            f"{json.dumps(diagnostic_store['raw_chat_time_recall_gate'], ensure_ascii=False)}"
+        )
+
+        try:
+            raw_chat_recall_rows: list[tuple[str, str, float]] = []
+            if strict_time_recall:
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    None,
+                    float(time_filter.get("start_ts", 0.0) or 0.0),
+                    float(time_filter.get("end_ts", 0.0) or 0.0),
+                    None,
+                )
+            elif recall_request.get("raw_chat_priority"):
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+
+            if not raw_chat_recall_rows and normalized_time_range in {"just_now", "recent_context"}:
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+
+            if not raw_chat_recall_rows and normalized_time_range in {
+                "just_now",
+                "recent_context",
+                "earlier_context",
+                "last_time",
+            }:
+                raw_chat_recall_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+
+            recent_user_rows = []
+            if not strict_time_recall:
+                recent_user_rows = await asyncio.to_thread(
+                    self._fetch_raw_chat_records,
+                    session_id,
+                    6,
+                    None,
+                    None,
+                    "User",
+                )
+            rows = (
+                []
+                if strict_time_recall
+                else (
+                    raw_chat_recall_rows
+                    if raw_chat_recall_rows
+                    else await asyncio.to_thread(
+                        self._fetch_recent_raw_chat_records, session_id, 15
+                    )
+                )
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"[时间槽分类] 原始聊天锚点失败 session={session_id} error={exc}",
+                exc_info=True,
+            )
+            return
+
+        if not rows and not recent_user_rows and not strict_time_recall:
+            self.logger.debug(
+                f"[时间槽分类] 跳过 session={session_id} 原因=无物理对话记录"
+            )
+            return
+
+        recall_policy = {
+            "recall_mode": recall_mode,
+            "recall_request": recall_request,
+            "time_intent": final_time_intent,
+            "time_filter": time_filter,
+            "strict_time_recall": strict_time_recall,
+            "disable_global_semantic_retrieval": bool(strict_time_recall),
+            "raw_chat_full_replay": bool(strict_time_recall),
+            "long_term_memory_full_replay": bool(strict_time_recall),
+            "sort_by_timestamp": "asc" if strict_time_recall else "mixed",
+            "prefer_raw_chat_only": False if strict_time_recall else bool(raw_chat_recall_rows and exact_raw_chat_only),
+            "restrict_injection": bool(strict_time_recall or (raw_chat_recall_rows and exact_raw_chat_only)),
+            "skip_notes": bool(strict_time_recall or (raw_chat_recall_rows and exact_raw_chat_only)),
+            "raw_chat_recall_rows": raw_chat_recall_rows,
+            "recent_fact_rows": recent_user_rows,
+        }
+        setattr(event, "_angel_memory_recall_policy", recall_policy)
+
+        diagnostic_store["recall_policy"] = {
+            "recall_mode": str(recall_policy.get("recall_mode", "") or ""),
+            "strict_time_recall": bool(recall_policy.get("strict_time_recall")),
+            "disable_global_semantic_retrieval": bool(recall_policy.get("disable_global_semantic_retrieval")),
+            "raw_chat_full_replay": bool(recall_policy.get("raw_chat_full_replay")),
+            "long_term_memory_full_replay": bool(recall_policy.get("long_term_memory_full_replay")),
+            "sort_by_timestamp": str(recall_policy.get("sort_by_timestamp", "") or ""),
+            "prefer_raw_chat_only": bool(recall_policy.get("prefer_raw_chat_only")),
+            "restrict_injection": bool(recall_policy.get("restrict_injection")),
+            "skip_notes": bool(recall_policy.get("skip_notes")),
+        }
+        diagnostic_store["time_slot_final_strategy"] = {
+            "recall_mode": recall_mode,
+            "strict_time_recall": bool(strict_time_recall),
+            "time_filter_matched": bool(time_filter.get("matched")),
+            "time_filter_applied": bool(strict_time_recall and time_filter.get("matched")),
+            "start_ts": float(time_filter.get("start_ts", 0.0) or 0.0),
+            "end_ts": float(time_filter.get("end_ts", 0.0) or 0.0),
+            "disable_global_semantic_retrieval": bool(recall_policy.get("disable_global_semantic_retrieval")),
+            "raw_chat_full_replay": bool(recall_policy.get("raw_chat_full_replay")),
+            "long_term_memory_full_replay": bool(recall_policy.get("long_term_memory_full_replay")),
+            "sort_by_timestamp": str(recall_policy.get("sort_by_timestamp", "") or ""),
+            "skip_notes": bool(recall_policy.get("skip_notes")),
+            "restrict_injection": bool(recall_policy.get("restrict_injection")),
+            "prefer_raw_chat_only": bool(recall_policy.get("prefer_raw_chat_only")),
+        }
+        self.logger.info(
+            "[时间槽分类][最终检索策略] payload="
+            f"{json.dumps(diagnostic_store['time_slot_final_strategy'], ensure_ascii=False)}"
+        )
+
+        system_prompt_suffix = ""
+        if raw_chat_recall_rows:
+            self._remember_raw_chat_recall_diagnostic(
+                event,
+                session_id,
+                raw_chat_recall_rows,
+                recall_policy,
+            )
+            system_prompt_suffix += self._build_raw_chat_recall_block(
+                raw_chat_recall_rows,
+                recall_policy,
+            )
+
+        if recent_user_rows:
+            diagnostic_store["recent_fact_layer"] = {
+                "session_id": session_id,
+                "row_count": len(recent_user_rows),
+                "summary": summarize_raw_chat_rows(recent_user_rows),
+            }
+            system_prompt_suffix += self._build_recent_fact_block(recent_user_rows)
+
+        if rows:
+            self._remember_raw_chat_diagnostic(event, session_id, rows)
+            system_prompt_suffix += self._build_raw_chat_anchor(rows)
+
+        request.system_prompt = (
+            f"{str(getattr(request, 'system_prompt', '') or '')}"
+            f"{system_prompt_suffix}"
+        )
+        self.logger.info(
+            f"[时间槽分类] 完成 session={session_id} anchor条数={len(rows)} "
+            f"回顾条数={len(raw_chat_recall_rows)} 近期事实条数={len(recent_user_rows)}"
+        )
+
     def _load_complete_config(self):
         """在主线程检查配置项"""
         try:
@@ -653,7 +1372,7 @@ class AngelMemoryPlugin(Star):
         await self._log_event_persona(event)
         await self._log_group_id_once(event)
         try:
-            await self._inject_recent_raw_chat_anchor(event, request)
+            await self._inject_recent_raw_chat_anchor_v2(event, request)
 
             # 检查LLM工具是否可用
             if not self.are_llm_tools_enabled():

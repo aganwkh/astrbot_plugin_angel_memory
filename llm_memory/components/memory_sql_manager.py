@@ -829,7 +829,8 @@ class MemorySqlManager:
         self,
         memory_scope: str,
         time_filter: Dict[str, Any],
-        limit: int,
+        limit: Optional[int],
+        sort_order: str = "desc",
     ) -> List[BaseMemory]:
         normalized_time_filter = self._normalize_time_filter(time_filter)
         if not normalized_time_filter:
@@ -873,6 +874,7 @@ class MemorySqlManager:
             return []
         scope_cond, scope_params = self._scope_sql(memory_scope, "mr")
         time_cond, time_params = self._build_exact_time_window_sql("mr", normalized_time_filter)
+        order_direction = "ASC" if str(sort_order or "").lower() == "asc" else "DESC"
         sql = f"""
             SELECT {self._select_memory_columns_sql()}
             FROM memory_records mr
@@ -884,24 +886,38 @@ class MemorySqlManager:
                     WHEN mr.event_end_ts > 0 THEN mr.event_end_ts
                     WHEN mr.source_end_ts > 0 THEN mr.source_end_ts
                     ELSE mr.created_at
-                END DESC,
-                mr.created_at DESC
-            LIMIT ?
+                END {order_direction},
+                mr.created_at {order_direction}
         """
         with self._connect() as conn:
-            rows = conn.execute(
-                sql,
-                (
-                    *scope_params,
-                    *time_params,
-                    max(1, int(limit)),
-                ),
-            ).fetchall()
+            params: List[Any] = [*scope_params, *time_params]
+            if limit is not None and int(limit) > 0:
+                sql = f"{sql}\nLIMIT ?"
+                params.append(max(1, int(limit)))
+            rows = conn.execute(sql, tuple(params)).fetchall()
             tags_map = self._fetch_tags_for_memory_ids(
                 conn,
                 [str(row["id"]) for row in rows],
             )
         return [self._row_to_memory(row, tags_map.get(str(row["id"]), [])) for row in rows]
+
+    async def list_memories_in_time_window(
+        self,
+        memory_scope: str,
+        time_filter: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+        sort_order: str = "asc",
+    ) -> List[BaseMemory]:
+        normalized_time_filter = self._normalize_time_filter(time_filter)
+        if not normalized_time_filter:
+            return []
+        return await asyncio.to_thread(
+            self._get_memories_in_time_window_sync,
+            memory_scope,
+            normalized_time_filter,
+            limit,
+            sort_order,
+        )
 
     @staticmethod
     def _extract_search_terms(query: str) -> List[str]:

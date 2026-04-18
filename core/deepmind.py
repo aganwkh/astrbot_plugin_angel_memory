@@ -372,7 +372,7 @@ class DeepMind:
         except Exception as e:
             self.logger.debug(f"[时间过滤诊断] 预解析 memory_scope 失败，已忽略: {e}")
 
-        time_diagnostic = analyze_time_intent(message_text)
+        rule_time_diagnostic = analyze_time_intent(message_text)
         recall_policy = getattr(event, "_angel_memory_recall_policy", {}) or {}
         recall_request = (
             recall_policy.get("recall_request", {})
@@ -382,9 +382,10 @@ class DeepMind:
         if not isinstance(recall_request, dict) or not recall_request:
             recall_request = analyze_recall_request(message_text)
         if not isinstance(recall_policy, dict) or not recall_policy:
-            fallback_time_filter = build_time_filter_payload(time_diagnostic)
+            fallback_time_filter = build_time_filter_payload("")
             recall_policy = {
                 "recall_request": recall_request,
+                "time_intent": rule_time_diagnostic.to_dict() if fallback_time_filter.get("matched") else {},
                 "time_filter": fallback_time_filter,
                 "strict_time_recall": bool(fallback_time_filter.get("matched")),
                 "restrict_injection": bool(fallback_time_filter.get("matched")),
@@ -392,6 +393,11 @@ class DeepMind:
                 "prefer_raw_chat_only": False,
             }
             setattr(event, "_angel_memory_recall_policy", recall_policy)
+        time_intent = (
+            dict(recall_policy.get("time_intent", {}) or {})
+            if isinstance(recall_policy, dict)
+            else {}
+        )
         time_filter = (
             dict(recall_policy.get("time_filter", {}) or {})
             if isinstance(recall_policy, dict)
@@ -402,14 +408,15 @@ class DeepMind:
                 "session_id": session_id,
                 "raw_user_input": message_text,
                 "memory_scope_preview": memory_scope_preview,
-                "time_intent": time_diagnostic.to_dict(),
+                "time_intent": time_intent,
+                "time_intent_rule_preview": rule_time_diagnostic.to_dict(),
                 "time_filter": time_filter,
                 "recall_request": recall_request,
             }
         )
         self.logger.info(
             f"[时间过滤诊断][输入] session={session_id} payload="
-            f"{json.dumps({'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_diagnostic.to_dict(), 'recall_request': recall_request, 'time_filter': time_filter}, ensure_ascii=False)}"
+            f"{json.dumps({'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_intent, 'time_intent_rule_preview': rule_time_diagnostic.to_dict(), 'recall_request': recall_request, 'time_filter': time_filter}, ensure_ascii=False)}"
         )
 
         # 1. 从 event.angelheart_context 中获取对话历史（仅保留未处理消息）

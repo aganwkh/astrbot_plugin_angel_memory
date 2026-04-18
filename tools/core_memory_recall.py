@@ -8,14 +8,15 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..core.session_memory import MemoryItem
 from ..core.utils.memory_formatter import MemoryFormatter
+from ..core.utils.memory_time import primary_timestamp
 from ..core.utils.time_diagnostics import (
     analyze_recall_request,
     analyze_time_intent,
+    build_time_intent_from_slot,
     build_time_filter_payload,
     get_event_diagnostic_store,
     preview_text,
     summarize_memory_records,
-    tool_time_range_to_intent,
 )
 from ..llm_memory.models.data_models import BaseMemory
 
@@ -175,23 +176,60 @@ class CoreMemoryRecallTool(FunctionTool):
 
         return sampled_memories
 
+    @staticmethod
+    def _sort_memories_for_time_slot_replay(memories: List[BaseMemory]) -> List[BaseMemory]:
+        return sorted(
+            list(memories or []),
+            key=lambda mem: (
+                float(primary_timestamp(mem) or 0.0),
+                float(getattr(mem, "created_at", 0.0) or 0.0),
+                str(getattr(mem, "id", "") or ""),
+            ),
+        )
+
+    async def _load_time_slot_replay_memories(
+        self,
+        memory_runtime: Any,
+        memory_scope: str,
+        time_filter: Dict[str, Any],
+    ) -> List[BaseMemory]:
+        if not isinstance(time_filter, dict) or not bool(time_filter.get("matched")):
+            return []
+
+        list_method = getattr(memory_runtime, "list_memories_in_time_window", None)
+        if callable(list_method):
+            memories = await list_method(
+                memory_scope=memory_scope,
+                time_filter=time_filter,
+                limit=None,
+                sort_order="asc",
+            )
+            return self._sort_memories_for_time_slot_replay(memories)
+
+        return []
+
     def _resolve_time_intent(
         self,
+        event: AstrMessageEvent,
         explicit_time_range: str,
-        original_user_text: str,
-        original_query: str,
-        query: str,
     ) -> Tuple[str, Any]:
-        candidates = [
-            ("explicit_time_range", tool_time_range_to_intent(explicit_time_range)),
-            ("original_user_text", analyze_time_intent(original_user_text)),
-            ("original_query", analyze_time_intent(original_query)),
-            ("tool_query", analyze_time_intent(query)),
-        ]
-        for source, intent in candidates:
-            if intent.matched and build_time_filter_payload(intent).get("matched"):
-                return source, intent
-        return "none", tool_time_range_to_intent("", timezone_name="Asia/Shanghai")
+        recall_policy = getattr(event, "_angel_memory_recall_policy", {}) or {}
+        if str(explicit_time_range or "").strip():
+            explicit_intent = build_time_intent_from_slot(str(explicit_time_range or "").strip())
+            if explicit_intent.matched and build_time_filter_payload(explicit_intent).get("matched"):
+                return "explicit_time_range", explicit_intent
+
+        if isinstance(recall_policy, dict):
+            policy_intent = recall_policy.get("time_intent", {}) or {}
+            normalized_time_range = str(
+                policy_intent.get("normalized_time_range", "") or ""
+            ).strip()
+            if normalized_time_range:
+                final_intent = build_time_intent_from_slot(normalized_time_range)
+                if final_intent.matched and build_time_filter_payload(final_intent).get("matched"):
+                    return "event_recall_policy", final_intent
+
+        return "none", build_time_intent_from_slot("", timezone_name="Asia/Shanghai")
 
     async def run(
         self,
@@ -236,15 +274,20 @@ class CoreMemoryRecallTool(FunctionTool):
             self.logger.error(f"{self.name}: 无法获取上下文信息或 memory_runtime 实例: {e}")
             return "错误：无法确定当前会话 ID，主动回忆已拒绝。"
 
-        explicit_time_intent = tool_time_range_to_intent(time_range)
+        explicit_time_intent = build_time_intent_from_slot(time_range)
         source_name, resolved_time_intent = self._resolve_time_intent(
+            event=event,
             explicit_time_range=time_range,
-            original_user_text=raw_user_input,
-            original_query=fallback_original_query,
-            query=tool_query,
         )
         resolved_time_filter = build_time_filter_payload(resolved_time_intent)
         recall_request = analyze_recall_request(raw_user_input)
+        recall_policy = getattr(event, "_angel_memory_recall_policy", {}) or {}
+        recall_mode = str(recall_policy.get("recall_mode", "") or "")
+        full_replay_mode = bool(
+            recall_mode == "time_slot_replay_full"
+            and resolved_time_filter.get("matched")
+            and recall_policy.get("disable_global_semantic_retrieval")
+        )
 
         recall_tool_payload = {
             "raw_user_input": raw_user_input,
@@ -257,20 +300,34 @@ class CoreMemoryRecallTool(FunctionTool):
             "time_intent_from_tool_query": analyze_time_intent(tool_query).to_dict(),
             "resolved_time_intent_source": source_name,
             "resolved_time_filter": resolved_time_filter,
+            "recall_mode": recall_mode,
+            "disable_global_semantic_retrieval": bool(recall_policy.get("disable_global_semantic_retrieval")),
+            "raw_chat_full_replay": bool(recall_policy.get("raw_chat_full_replay")),
+            "long_term_memory_full_replay": bool(recall_policy.get("long_term_memory_full_replay")),
+            "sort_by_timestamp": str(recall_policy.get("sort_by_timestamp", "") or ""),
             "recall_request": recall_request,
+            "time_slot_classification": diagnostic_store.get("time_slot_classification", {}),
+            "event_recall_policy": recall_policy,
             "query_build": diagnostic_store.get("query_build", {}),
             "query_pipeline": diagnostic_store.get("query_pipeline", {}),
         }
 
         try:
-            candidate_limit = max(int(limit) * 3, 20)
-            all_memories: List[BaseMemory] = await memory_runtime.comprehensive_recall(
-                query=tool_query,
-                fresh_limit=candidate_limit,
-                event=event,
-                memory_scope=memory_scope,
-                time_filter=resolved_time_filter if resolved_time_filter.get("matched") else None,
-            )
+            if full_replay_mode:
+                all_memories = await self._load_time_slot_replay_memories(
+                    memory_runtime=memory_runtime,
+                    memory_scope=memory_scope,
+                    time_filter=resolved_time_filter,
+                )
+            else:
+                candidate_limit = max(int(limit) * 3, 20)
+                all_memories = await memory_runtime.comprehensive_recall(
+                    query=tool_query,
+                    fresh_limit=candidate_limit,
+                    event=event,
+                    memory_scope=memory_scope,
+                    time_filter=resolved_time_filter if resolved_time_filter.get("matched") else None,
+                )
 
             active_memories = [mem for mem in all_memories if bool(getattr(mem, "is_active", False))]
             inactive_memories = [mem for mem in all_memories if not bool(getattr(mem, "is_active", False))]
@@ -278,6 +335,7 @@ class CoreMemoryRecallTool(FunctionTool):
             recall_tool_payload.update(
                 {
                     "memory_scope": memory_scope,
+                    "full_replay_mode": full_replay_mode,
                     "total_hits": len(all_memories),
                     "active_hits": len(active_memories),
                     "inactive_hits": len(inactive_memories),
@@ -295,8 +353,20 @@ class CoreMemoryRecallTool(FunctionTool):
 
             if not all_memories:
                 recall_tool_payload["final_returned_hits"] = 0
-                recall_tool_payload["final_returned_mode"] = "empty"
+                recall_tool_payload["final_returned_mode"] = (
+                    "time_slot_replay_empty" if full_replay_mode else "empty"
+                )
                 return "没有找到相关记忆。"
+
+            if full_replay_mode:
+                ordered_memories = self._sort_memories_for_time_slot_replay(all_memories)
+                recall_tool_payload["final_returned_hits"] = len(ordered_memories)
+                recall_tool_payload["final_returned_mode"] = "time_slot_replay_full"
+                self.logger.info(
+                    f"[鏃堕棿杩囨护璇婃柇][core_memory_recall杩斿洖] payload="
+                    f"{json.dumps({'mode': 'time_slot_replay_full', 'returned': len(ordered_memories)}, ensure_ascii=False)}"
+                )
+                return self._format_memories(ordered_memories)
 
             if active_memories:
                 sampled_memories = self._sample_active_memories(active_memories, int(limit))

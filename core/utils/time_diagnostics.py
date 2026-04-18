@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import json
 import re
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -14,6 +15,64 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+TIME_SLOT_CONFIDENCE_THRESHOLD = 0.75
+TIME_SLOT_CACHE_TTL_SECONDS = 600
+
+CANONICAL_NON_TOOL_TIME_SLOT_INPUTS = {
+    "recent_context": "\u524d\u9762",
+    "earlier_context": "\u4e4b\u524d",
+    "last_time": "\u4e0a\u6b21",
+    "last_weekday_0": "\u4e0a\u5468\u4e00",
+    "last_weekday_1": "\u4e0a\u5468\u4e8c",
+    "last_weekday_2": "\u4e0a\u5468\u4e09",
+    "last_weekday_3": "\u4e0a\u5468\u56db",
+    "last_weekday_4": "\u4e0a\u5468\u4e94",
+    "last_weekday_5": "\u4e0a\u5468\u516d",
+    "last_weekday_6": "\u4e0a\u5468\u65e5",
+}
+
+LOW_INFORMATION_FOLLOWUP_PHRASES = [
+    "\u90a3\u4e2a",
+    "\u90a3\u6b21",
+    "\u90a3\u6b21\u5462",
+    "\u90a3\u4f1a\u513f",
+    "\u5c31\u90a3\u4e2a",
+    "\u5c31\u90a3\u6b21",
+    "\u5c31\u90a3\u4e2a\u65f6\u95f4",
+    "\u90fd\u804a\u4e86\u4e9b\u4ec0\u4e48",
+    "\u804a\u4e86\u4e9b\u4ec0\u4e48",
+    "\u90fd\u8bf4\u4e86\u4e9b\u4ec0\u4e48",
+    "\u8bf4\u4e86\u4e9b\u4ec0\u4e48",
+    "\u524d\u9762\u90a3\u4e2a\u5462",
+    "\u4f60\u518d\u60f3\u60f3",
+    "\u518d\u60f3\u60f3",
+    "\u4e0d\u662f\u90a3\u4e2a\u5417",
+    "\u4e0d\u662f\u90a3\u6b21\u5417",
+    "\u5f53\u65f6\u90a3\u4e2a",
+]
+
+RECALL_REVIEW_HINT_PHRASES = [
+    "\u8fd8\u8bb0\u5f97",
+    "\u804a\u4e86\u4ec0\u4e48",
+    "\u804a\u4e86\u4e9b\u4ec0\u4e48",
+    "\u90fd\u804a\u4e86\u4e9b\u4ec0\u4e48",
+    "\u8bf4\u4e86\u4ec0\u4e48",
+    "\u8bf4\u4e86\u4e9b\u4ec0\u4e48",
+    "\u90fd\u8bf4\u4e86\u4e9b\u4ec0\u4e48",
+    "\u539f\u8bdd",
+    "\u539f\u53e5",
+    "\u63d0\u8fc7",
+    "\u56de\u5fc6",
+    "\u56de\u987e",
+    "review",
+    "recall",
+]
+
+TIME_SLOT_TRIGGER_TIME_PHRASES = [
+    "\u4eca\u5929\u51cc\u6668",
+    "\u51cc\u6668\u90a3\u4f1a\u513f",
+    "\u6628\u5929\u51cc\u6668",
+]
 
 WEEKDAY_TEXT_TO_INDEX = {
     "一": 0,
@@ -52,11 +111,15 @@ TOOL_TIME_RANGE_SPECS = {
 
 RECALL_TRIGGER_PHRASES = [
     "聊了什么",
+    "聊了些什么",
+    "都聊了些什么",
     "聊过什么",
     "聊的什么",
     "聊了啥",
     "聊过啥",
     "说了什么",
+    "说了些什么",
+    "都说了些什么",
     "说过什么",
     "说的什么",
     "说了啥",
@@ -78,10 +141,14 @@ RAW_CHAT_PRIORITY_PHRASES = [
     "原话",
     "原句",
     "说了什么",
+    "说了些什么",
+    "都说了些什么",
     "说过什么",
     "说的什么",
     "说了啥",
     "聊了什么",
+    "聊了些什么",
+    "都聊了些什么",
     "聊过什么",
     "聊的什么",
     "聊了啥",
@@ -129,6 +196,46 @@ class TimeIntentDiagnostic:
         }
 
 
+@dataclass
+class TimeSlotSelectionResult:
+    decision: str = "abstain"
+    selected_time_slot: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+    inherit_previous: bool = False
+    abstain: bool = True
+    parse_success: bool = False
+    is_valid_slot: bool = False
+    low_confidence: bool = False
+    error: str = ""
+    raw_response: str = ""
+    raw_response_original: str = ""
+    raw_response_sanitized: str = ""
+    extraction_mode: str = ""
+    parse_error: str = ""
+    confidence_threshold: float = TIME_SLOT_CONFIDENCE_THRESHOLD
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "decision": str(self.decision or "abstain"),
+            "selected_time_slot": str(self.selected_time_slot or ""),
+            "confidence": float(self.confidence or 0.0),
+            "reason": str(self.reason or ""),
+            "inherit_previous": bool(self.inherit_previous),
+            "abstain": bool(self.abstain),
+            "parse_success": bool(self.parse_success),
+            "is_valid_slot": bool(self.is_valid_slot),
+            "low_confidence": bool(self.low_confidence),
+            "error": str(self.error or ""),
+            "raw_response": str(self.raw_response or ""),
+            "raw_response_original": str(self.raw_response_original or ""),
+            "raw_response_sanitized": str(self.raw_response_sanitized or ""),
+            "extraction_mode": str(self.extraction_mode or ""),
+            "parse_error": str(self.parse_error or ""),
+            "confidence_threshold": float(self.confidence_threshold or 0.0),
+        }
+
+
 def _get_now(timezone_name: str = DEFAULT_TIMEZONE) -> datetime:
     if ZoneInfo is not None:
         try:
@@ -168,6 +275,107 @@ def _match_phrases(text: str, phrases: Sequence[str]) -> List[str]:
         if re.search(re.escape(phrase), safe_text, flags=re.IGNORECASE):
             matched.append(phrase)
     return matched
+
+
+def _strip_json_fence(text: str) -> str:
+    safe_text = str(text or "").strip()
+    if not safe_text.startswith("```"):
+        return safe_text
+    fenced_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", safe_text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced_match:
+        return str(fenced_match.group(1) or "").strip()
+    return safe_text
+
+
+def _extract_first_json_object(text: str) -> str:
+    safe_text = str(text or "")
+    start_index = -1
+    depth = 0
+    in_string = False
+    escaping = False
+    for index, char in enumerate(safe_text):
+        if start_index < 0:
+            if char == "{":
+                start_index = index
+                depth = 1
+            continue
+
+        if in_string:
+            if escaping:
+                escaping = False
+            elif char == "\\":
+                escaping = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                return safe_text[start_index : index + 1].strip()
+    return ""
+
+
+def is_low_information_followup(text: str) -> bool:
+    safe_text = re.sub(r"\s+", "", str(text or "").strip())
+    if not safe_text:
+        return False
+    if safe_text in LOW_INFORMATION_FOLLOWUP_PHRASES:
+        return True
+    if len(safe_text) <= 8 and any(phrase in safe_text for phrase in LOW_INFORMATION_FOLLOWUP_PHRASES):
+        return True
+    return False
+
+
+def is_recall_or_review_query(text: str, recall_request: Dict[str, Any] | None = None) -> bool:
+    safe_text = str(text or "").strip()
+    if not safe_text:
+        return False
+    recall_request = recall_request or {}
+    if bool(recall_request.get("matched")):
+        return True
+    lowered = safe_text.lower()
+    return any(phrase in lowered for phrase in RECALL_REVIEW_HINT_PHRASES)
+
+
+def analyze_time_slot_classifier_trigger(
+    text: str,
+    recall_request: Dict[str, Any] | None = None,
+    time_intent: TimeIntentDiagnostic | None = None,
+) -> Dict[str, Any]:
+    safe_text = str(text or "").strip()
+    recall_request = recall_request or analyze_recall_request(safe_text)
+    time_intent = time_intent or analyze_time_intent(safe_text)
+    low_info_followup = is_low_information_followup(safe_text)
+    recall_or_review = is_recall_or_review_query(safe_text, recall_request)
+    contains_time_expression = bool(
+        time_intent.matched or any(phrase in safe_text for phrase in TIME_SLOT_TRIGGER_TIME_PHRASES)
+    )
+
+    trigger_reasons: List[str] = []
+    if contains_time_expression:
+        trigger_reasons.append("contains_time_expression")
+    if recall_or_review:
+        trigger_reasons.append("recall_or_review_semantics")
+    if low_info_followup:
+        trigger_reasons.append("low_information_followup")
+
+    return {
+        "raw_user_input": safe_text,
+        "contains_time_expression": contains_time_expression,
+        "recall_or_review": recall_or_review,
+        "low_information_followup": low_info_followup,
+        "trigger_reason": trigger_reasons,
+        "should_call_classifier": bool(trigger_reasons),
+        "time_intent": time_intent.to_dict(),
+        "recall_request": dict(recall_request or {}),
+    }
 
 
 def _start_of_day(dt: datetime) -> datetime:
@@ -319,6 +527,14 @@ def analyze_time_intent(
             "note": "映射到 today_morning。",
         },
         {
+            "intent_type": "凌晨",
+            "normalized_time_range": "early_morning",
+            "phrases": ["今天凌晨", "凌晨那会儿"],
+            "start": today,
+            "end": today.replace(hour=5, minute=59, second=59),
+            "note": "映射到 early_morning。",
+        },
+        {
             "intent_type": "今天下午",
             "normalized_time_range": "today_afternoon",
             "phrases": ["今天下午"],
@@ -341,6 +557,14 @@ def analyze_time_intent(
             "start": yesterday.replace(hour=18),
             "end": _end_of_day(yesterday),
             "note": "映射到 last_night。",
+        },
+        {
+            "intent_type": "昨天凌晨",
+            "normalized_time_range": "yesterday_early_morning",
+            "phrases": ["昨天凌晨"],
+            "start": yesterday,
+            "end": yesterday.replace(hour=5, minute=59, second=59),
+            "note": "映射到 yesterday_early_morning。",
         },
         {
             "intent_type": "昨天上午",
@@ -415,6 +639,435 @@ def analyze_time_intent(
         )
 
     return TimeIntentDiagnostic(timezone=timezone_name)
+
+
+def build_time_intent_from_slot(
+    time_slot: str,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> TimeIntentDiagnostic:
+    safe_slot = str(time_slot or "").strip()
+    if not safe_slot:
+        return TimeIntentDiagnostic(timezone=timezone_name)
+
+    if safe_slot in TOOL_TIME_RANGE_SPECS:
+        return tool_time_range_to_intent(safe_slot, timezone_name=timezone_name)
+
+    canonical_input = CANONICAL_NON_TOOL_TIME_SLOT_INPUTS.get(safe_slot, "")
+    if not canonical_input:
+        return TimeIntentDiagnostic(timezone=timezone_name)
+
+    intent = analyze_time_intent(canonical_input, timezone_name=timezone_name)
+    if intent.matched and intent.normalized_time_range == safe_slot:
+        return intent
+    return TimeIntentDiagnostic(timezone=timezone_name)
+
+
+def get_legal_time_slot_catalog(
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> Dict[str, Dict[str, Any]]:
+    catalog: Dict[str, Dict[str, Any]] = {}
+
+    for slot_name in TOOL_TIME_RANGE_SPECS.keys():
+        intent = build_time_intent_from_slot(slot_name, timezone_name=timezone_name)
+        if not intent.matched:
+            continue
+        payload = intent.to_dict()
+        payload["slot_name"] = slot_name
+        catalog[slot_name] = payload
+
+    for slot_name in CANONICAL_NON_TOOL_TIME_SLOT_INPUTS.keys():
+        intent = build_time_intent_from_slot(slot_name, timezone_name=timezone_name)
+        if not intent.matched:
+            continue
+        payload = intent.to_dict()
+        payload["slot_name"] = slot_name
+        catalog[slot_name] = payload
+
+    return catalog
+
+
+def get_legal_time_slot_names(
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> List[str]:
+    return sorted(get_legal_time_slot_catalog(timezone_name=timezone_name).keys())
+
+
+def is_valid_legal_time_slot(
+    time_slot: str,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> bool:
+    safe_slot = str(time_slot or "").strip()
+    if not safe_slot:
+        return False
+    intent = build_time_intent_from_slot(safe_slot, timezone_name=timezone_name)
+    return bool(intent.matched and intent.normalized_time_range == safe_slot)
+
+
+def _build_time_slot_semantic_definition(
+    slot_name: str,
+    payload: Dict[str, Any],
+) -> str:
+    intent_type = str(payload.get("intent_type", "") or "")
+    note = str(payload.get("note", "") or "")
+    start_time = str(payload.get("start_time", "") or "")
+    end_time = str(payload.get("end_time", "") or "")
+
+    if slot_name == "just_now":
+        return "The very recent part of the current conversation context, anchored to immediacy rather than a calendar date."
+    if slot_name == "recent_context":
+        return "A nearby earlier part of the current conversation context, still recent but not necessarily the latest few messages."
+    if slot_name == "earlier_context":
+        return "Something mentioned earlier in the broader conversation context, less immediate than recent_context."
+    if slot_name == "last_time":
+        return "The previous occurrence or previous chat/topic turn, anchored to 'last time' semantics instead of a specific date."
+    if slot_name.startswith("last_weekday_"):
+        return (
+            f"A specific weekday from last week. Current slot means {intent_type}. "
+            f"Use it when the user clearly points to that exact weekday."
+        )
+
+    if start_time and end_time:
+        return (
+            f"{intent_type} semantic window. This slot covers the time span from "
+            f"{start_time} to {end_time}. {note}"
+        )
+    return f"{intent_type} semantic window. {note}"
+
+
+def _build_time_slot_representative_examples(slot_name: str) -> List[str]:
+    direct_examples = {
+        "just_now": ["刚才那个", "刚刚聊的", "前两句说的"],
+        "recent_context": ["前面不是说过吗", "刚才前面那段", "前文提到的"],
+        "earlier_context": ["之前那次", "更早前说过的", "前面某次聊到的"],
+        "last_time": ["上次那个", "上回聊的", "前一次说过的"],
+        "early_morning": ["今天凌晨那个", "今天半夜聊的", "凌晨一点那次"],
+        "today_morning": ["今天上午那个", "早上聊的", "上午那会儿说的"],
+        "noon": ["今天中午那个", "中午聊的", "午饭前后那次"],
+        "today_afternoon": ["今天下午那个", "下午聊的", "下午那会儿说的"],
+        "today_night": ["今晚那个", "今天晚上聊的", "今晚那次"],
+        "yesterday_early_morning": ["昨天凌晨那个", "昨夜过零点那次", "昨天半夜聊的"],
+        "yesterday_morning": ["昨天上午那个", "昨天早上聊的", "昨早那次"],
+        "yesterday_noon": ["昨天中午那个", "昨天午饭前后", "昨儿中午聊的"],
+        "yesterday_afternoon": ["昨天下午那个", "昨天下午聊的", "昨儿下午那次"],
+        "last_night": ["昨晚那个", "昨天晚上聊的", "昨晚那次"],
+        "yesterday": ["昨天那天", "昨天聊的", "前一天那次"],
+        "a_few_days_ago": ["前几天那个", "这几天前面聊过的", "前几天那次"],
+        "this_week": ["这周那个", "本周聊的", "这周里说过的"],
+        "past_7_days": ["最近七天那个", "近一周聊的", "这七天里提过的"],
+        "last_weekend": ["上周末那个", "上周六日聊的", "上个周末那次"],
+        "this_month": ["这个月那个", "本月聊过的", "这个月里提到的"],
+        "past_30_days": ["最近三十天那个", "近一个月聊的", "最近一个月提过的"],
+        "past_3_months": ["最近三个月那个", "近三个月聊的", "这几个月里提过的"],
+        "this_year": ["今年那个", "今年聊过的", "今年里提到的"],
+        "past_year": ["最近一年那个", "近一年聊过的", "这一年里提过的"],
+    }
+    if slot_name in direct_examples:
+        return direct_examples[slot_name]
+
+    if slot_name.startswith("last_weekday_"):
+        weekday_label = CANONICAL_NON_TOOL_TIME_SLOT_INPUTS.get(slot_name, "")
+        return [
+            f"{weekday_label}那个",
+            f"{weekday_label}聊的",
+            f"{weekday_label}那次",
+        ]
+    return []
+
+
+def _build_time_slot_adjacent_boundaries(slot_name: str) -> List[str]:
+    boundaries = {
+        "just_now": [
+            "Use this only for the immediately recent exchange, not for a broad earlier context.",
+            "If the user means an older part of the same chat, prefer recent_context or earlier_context.",
+        ],
+        "recent_context": [
+            "More recent than earlier_context, but broader than just_now.",
+            "If the user clearly means the latest few turns, prefer just_now.",
+        ],
+        "earlier_context": [
+            "Broader and less immediate than recent_context.",
+            "If the user says '上次' or points to the previous occurrence, prefer last_time.",
+        ],
+        "last_time": [
+            "Use this for '上次/上回/前一次' semantics, not generic earlier context.",
+            "If the user points to a calendar day, prefer the explicit day slot instead.",
+        ],
+        "early_morning": [
+            "Only for today after midnight and before the morning slot.",
+            "If the user means last night or yesterday after midnight, prefer last_night or yesterday_early_morning.",
+        ],
+        "today_morning": [
+            "Use this for today morning, not post-midnight pre-dawn or noon.",
+            "If the user means lunch-time, prefer noon.",
+        ],
+        "noon": [
+            "A narrow midday window, narrower than today_morning or today_afternoon.",
+            "If the user only means 'today' without noon specificity, prefer the broader day slot only when available.",
+        ],
+        "today_afternoon": [
+            "Use this after noon and before tonight.",
+            "If the user means evening or night, prefer today_night.",
+        ],
+        "today_night": [
+            "Use this for today's evening/night period.",
+            "If the user means after midnight, prefer early_morning instead of today_night.",
+        ],
+        "yesterday_early_morning": [
+            "This is yesterday after midnight and before yesterday morning.",
+            "If the user means yesterday evening, prefer last_night.",
+        ],
+        "yesterday_morning": [
+            "Use this for yesterday morning, not yesterday pre-dawn or noon.",
+            "If the user only means yesterday without a daypart, the broader yesterday slot is safer.",
+        ],
+        "yesterday_noon": [
+            "A narrow midday window inside yesterday.",
+            "If the user means a broader yesterday period, prefer yesterday.",
+        ],
+        "yesterday_afternoon": [
+            "Use this for yesterday afternoon, not yesterday night.",
+            "If the user only says 昨天 with no finer clue, prefer yesterday.",
+        ],
+        "last_night": [
+            "Use this for yesterday evening/night semantics.",
+            "Do not use it for today after midnight; that belongs to early_morning.",
+        ],
+        "yesterday": [
+            "Broad previous-day slot; if a narrower yesterday daypart is clearly expressed, prefer the narrower slot.",
+            "Do not use when the user explicitly means last night only.",
+        ],
+        "a_few_days_ago": [
+            "Broader than yesterday, but narrower than this_week or past_7_days when the user clearly says '前几天'.",
+            "If the user identifies a precise weekday or weekend, prefer that more specific slot.",
+        ],
+        "this_week": [
+            "Calendar-week semantics, not a rolling seven-day window.",
+            "If the user means a rolling recent interval, prefer past_7_days.",
+        ],
+        "past_7_days": [
+            "Rolling recent seven-day interval, not the calendar week.",
+            "If the user explicitly says '这周', prefer this_week.",
+        ],
+        "last_weekend": [
+            "Use only for last Saturday/Sunday semantics.",
+            "If the user names a weekday from last week, prefer last_weekday_x.",
+        ],
+        "this_month": [
+            "Calendar-month semantics.",
+            "If the user means a rolling recent month, prefer past_30_days.",
+        ],
+        "past_30_days": [
+            "Rolling recent 30-day interval.",
+            "If the user explicitly says '这个月/本月', prefer this_month.",
+        ],
+        "past_3_months": [
+            "Rolling recent three-month interval.",
+            "If the user clearly points to this month only, prefer this_month.",
+        ],
+        "this_year": [
+            "Calendar-year semantics.",
+            "If the user means a rolling recent year, prefer past_year.",
+        ],
+        "past_year": [
+            "Rolling recent one-year interval.",
+            "If the user explicitly means this calendar year, prefer this_year.",
+        ],
+    }
+    if slot_name in boundaries:
+        return boundaries[slot_name]
+    if slot_name.startswith("last_weekday_"):
+        weekday_label = CANONICAL_NON_TOOL_TIME_SLOT_INPUTS.get(slot_name, "上周某天")
+        return [
+            f"Use this only when the user clearly points to {weekday_label}.",
+            "If the user only says '上周末', prefer last_weekend; if the user says '上周' broadly, prefer a broader week slot when available.",
+        ]
+    return []
+
+
+def get_time_slot_catalog_for_prompt(
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> List[Dict[str, Any]]:
+    catalog = get_legal_time_slot_catalog(timezone_name=timezone_name)
+    prompt_items: List[Dict[str, Any]] = []
+    for slot_name in sorted(catalog.keys()):
+        payload = catalog[slot_name]
+        prompt_items.append(
+            {
+                "slot_name": slot_name,
+                "intent_type": str(payload.get("intent_type", "") or ""),
+                "note": str(payload.get("note", "") or ""),
+                "start_time": str(payload.get("start_time", "") or ""),
+                "end_time": str(payload.get("end_time", "") or ""),
+                "semantic_definition": _build_time_slot_semantic_definition(slot_name, payload),
+                "representative_examples": _build_time_slot_representative_examples(slot_name),
+                "adjacent_boundaries": _build_time_slot_adjacent_boundaries(slot_name),
+            }
+        )
+    return prompt_items
+
+
+def parse_time_slot_selection_response(
+    response_text: str,
+    legal_slots: Sequence[str],
+    confidence_threshold: float = TIME_SLOT_CONFIDENCE_THRESHOLD,
+) -> TimeSlotSelectionResult:
+    original_response = str(response_text or "")
+    result = TimeSlotSelectionResult(
+        raw_response=original_response,
+        raw_response_original=original_response,
+        confidence_threshold=float(confidence_threshold or 0.0),
+    )
+    safe_text = original_response.strip()
+    result.raw_response_sanitized = safe_text
+    if not safe_text:
+        result.error = "empty_response"
+        result.parse_error = "empty_response"
+        result.extraction_mode = "empty"
+        return result
+
+    payload = None
+    parse_attempts: List[str] = []
+    extraction_candidates = [
+        ("direct_json", safe_text),
+        ("fenced_json", _strip_json_fence(safe_text)),
+    ]
+    embedded_source = _strip_json_fence(safe_text)
+    extraction_candidates.append(("embedded_json", _extract_first_json_object(embedded_source)))
+
+    tried_payloads = set()
+    for extraction_mode, candidate_text in extraction_candidates:
+        normalized_candidate = str(candidate_text or "").strip()
+        if not normalized_candidate or normalized_candidate in tried_payloads:
+            continue
+        tried_payloads.add(normalized_candidate)
+        result.raw_response_sanitized = normalized_candidate
+        try:
+            payload = json.loads(normalized_candidate)
+            result.extraction_mode = extraction_mode
+            result.parse_error = ""
+            break
+        except Exception as exc:
+            parse_attempts.append(f"{extraction_mode}:{exc}")
+
+    if payload is None:
+        result.error = "json_parse_failed"
+        result.parse_error = " | ".join(parse_attempts)
+        if not result.extraction_mode:
+            result.extraction_mode = "failed"
+        return result
+
+    if not isinstance(payload, dict):
+        result.error = "payload_not_object"
+        result.parse_error = "payload_not_object"
+        return result
+
+    if "decision" in payload:
+        decision = payload.get("decision")
+        selected_time_slot = payload.get("selected_time_slot", "")
+        reason = payload.get("reason", "")
+        confidence = payload.get("confidence")
+
+        if not isinstance(decision, str):
+            result.error = "invalid_decision_type"
+            result.parse_error = "invalid_decision_type"
+            return result
+        if not isinstance(selected_time_slot, str):
+            result.error = "invalid_selected_time_slot_type"
+            result.parse_error = "invalid_selected_time_slot_type"
+            return result
+        if not isinstance(reason, str):
+            result.error = "invalid_reason_type"
+            result.parse_error = "invalid_reason_type"
+            return result
+        if confidence is not None and not isinstance(confidence, (int, float)):
+            result.error = "invalid_confidence_type"
+            result.parse_error = "invalid_confidence_type"
+            return result
+
+        normalized_decision = str(decision or "").strip()
+        if normalized_decision not in {"selected_time_slot", "abstain", "inherit_previous"}:
+            result.error = "invalid_decision_value"
+            result.parse_error = "invalid_decision_value"
+            return result
+
+        result.parse_success = True
+        result.decision = normalized_decision
+        result.selected_time_slot = str(selected_time_slot or "").strip()
+        result.reason = str(reason or "")
+        result.confidence = float(
+            confidence
+            if confidence is not None
+            else (1.0 if normalized_decision == "selected_time_slot" else 0.0)
+        )
+        result.inherit_previous = normalized_decision == "inherit_previous"
+        result.abstain = normalized_decision == "abstain"
+    else:
+        required_fields = [
+            "selected_time_slot",
+            "confidence",
+            "reason",
+            "inherit_previous",
+            "abstain",
+        ]
+        missing_fields = [field_name for field_name in required_fields if field_name not in payload]
+        if missing_fields:
+            result.error = f"missing_fields:{','.join(missing_fields)}"
+            result.parse_error = result.error
+            return result
+
+        selected_time_slot = payload.get("selected_time_slot")
+        confidence = payload.get("confidence")
+        reason = payload.get("reason")
+        inherit_previous = payload.get("inherit_previous")
+        abstain = payload.get("abstain")
+
+        if not isinstance(selected_time_slot, str):
+            result.error = "invalid_selected_time_slot_type"
+            result.parse_error = "invalid_selected_time_slot_type"
+            return result
+        if not isinstance(reason, str):
+            result.error = "invalid_reason_type"
+            result.parse_error = "invalid_reason_type"
+            return result
+        if not isinstance(inherit_previous, bool):
+            result.error = "invalid_inherit_previous_type"
+            result.parse_error = "invalid_inherit_previous_type"
+            return result
+        if not isinstance(abstain, bool):
+            result.error = "invalid_abstain_type"
+            result.parse_error = "invalid_abstain_type"
+            return result
+        if not isinstance(confidence, (int, float)):
+            result.error = "invalid_confidence_type"
+            result.parse_error = "invalid_confidence_type"
+            return result
+
+        result.parse_success = True
+        result.decision = "inherit_previous" if bool(inherit_previous) else ("abstain" if bool(abstain) else "selected_time_slot")
+        result.selected_time_slot = str(selected_time_slot or "").strip()
+        result.confidence = float(confidence or 0.0)
+        result.reason = str(reason or "")
+        result.inherit_previous = bool(inherit_previous)
+        result.abstain = bool(abstain)
+
+    result.is_valid_slot = result.selected_time_slot in {str(slot) for slot in legal_slots}
+    result.low_confidence = result.confidence < float(confidence_threshold or 0.0)
+
+    if result.inherit_previous:
+        return result
+    if result.abstain:
+        return result
+    if not result.is_valid_slot:
+        result.abstain = True
+        result.error = "illegal_time_slot"
+        result.parse_error = "illegal_time_slot"
+        return result
+    if result.low_confidence:
+        result.abstain = True
+        result.error = "low_confidence"
+        result.parse_error = "low_confidence"
+        return result
+    return result
 
 
 def compare_time_intent(before_text: str, after_text: str) -> Dict[str, Any]:
