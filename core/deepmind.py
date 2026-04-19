@@ -1087,6 +1087,7 @@ class DeepMind:
                 "payload": {
                     "reflection_input": payload.get("reflection_input"),
                     "historical_chat_text_override": historical_chat_text,
+                    "historical_chat_records": payload.get("historical_chat_records", []),
                 },
             }
         )
@@ -1122,14 +1123,20 @@ class DeepMind:
             return []
 
         shared_time_metadata = derive_time_metadata_from_chat_records(raw_chat_records)
+
         enriched_memories: List[Dict[str, Any]] = []
         for mem in new_memories:
             if not isinstance(mem, dict):
                 continue
             enriched = dict(mem)
+
             for key, value in shared_time_metadata.items():
                 if enriched.get(key) in (None, "", [], 0, 0.0):
                     enriched[key] = value
+
+            if "time_metadata" not in enriched:
+                enriched["time_metadata"] = shared_time_metadata
+
             enriched_memories.append(enriched)
         return enriched_memories
 
@@ -1256,6 +1263,7 @@ class DeepMind:
         self,
         reflection_input: ReflectionInput,
         historical_chat_text_override: str = "",
+        historical_chat_records: List[Dict[str, Any]] = None,
     ):
         """
         异步执行的记忆分析任务
@@ -1278,9 +1286,22 @@ class DeepMind:
                 context_data = {}
 
             query = str(context_data.get("query", "") or "")
-            raw_chat_records = context_data.get("raw_chat_records", [])
+            raw_chat_records = (
+                historical_chat_records
+                if historical_chat_records is not None
+                else context_data.get("raw_chat_records", [])
+            )
             if not isinstance(raw_chat_records, list):
                 raw_chat_records = []
+
+            try:
+                dumped_records = json.dumps(raw_chat_records, ensure_ascii=False)
+                self.logger.info(f"【真实截获】用于推导时间的原始数据: {dumped_records}")
+            except Exception as e:
+                self.logger.error(
+                    f"【真实截获】JSON序列化失败: {e}, 原始数据: {raw_chat_records}"
+                )
+
             source_metadata = self._build_source_message_metadata(raw_chat_records)
             self.logger.info(
                 f"[反思落库][source] session={session_id} "
