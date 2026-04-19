@@ -169,7 +169,7 @@ class QueryProcessor:
         if secretary_diagnostic.get("parse_error"):
             self.logger.warning(f"{log_prefix}{payload}")
         else:
-            self.logger.info(f"{log_prefix}{payload}")
+            self.logger.debug(f"{log_prefix}{payload}")
 
     def _extract_rag_fields_from_context(
         self,
@@ -372,7 +372,7 @@ class QueryProcessor:
                 "final_intent": analyze_time_intent(final_query).to_dict(),
             }
             self._store_query_diagnostic(event, query_kind, processor_diagnostic)
-            self.logger.info(
+            self.logger.debug(
                 f"[时间过滤诊断][query处理] kind={query_kind} payload="
                 f"{json.dumps(processor_diagnostic, ensure_ascii=False)}"
             )

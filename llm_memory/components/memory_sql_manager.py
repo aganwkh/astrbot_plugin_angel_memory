@@ -865,7 +865,7 @@ class MemorySqlManager:
                     ordered, normalized_time_filter
                 ),
             }
-            self.logger.info(
+            self.logger.debug(
                 f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(exact_payload, ensure_ascii=False)}"
             )
             return ordered
@@ -2440,7 +2440,7 @@ class MemorySqlManager:
                     ordered, normalized_time_filter
                 ),
             }
-            self.logger.info(
+            self.logger.debug(
                 f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(exact_payload, ensure_ascii=False)}"
             )
             return ordered
@@ -2455,7 +2455,7 @@ class MemorySqlManager:
             'time_filter': normalized_time_filter,
             'time_filter_note': '命中时间窗时，先在 SQL 中硬过滤 created_at，再在窗口内排序。',
         }
-        self.logger.info(
+        self.logger.debug(
             f"[时间过滤诊断][SimpleMemory检索入参] payload={json.dumps(payload, ensure_ascii=False)}"
         )
 
@@ -2474,7 +2474,7 @@ class MemorySqlManager:
                     'window_candidate_count': 0,
                     'result_summary': summarize_memory_records([]),
                 }
-                self.logger.info(
+                self.logger.debug(
                     f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
                 )
                 return []
@@ -2494,7 +2494,7 @@ class MemorySqlManager:
                 'window_candidate_count': len(candidate_memories),
                 'result_summary': summarize_memory_records(ordered),
             }
-            self.logger.info(
+            self.logger.debug(
                 f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
             )
             return ordered
@@ -2526,7 +2526,7 @@ class MemorySqlManager:
                 'time_filter_applied': False,
                 'result_summary': summarize_memory_records([]),
             }
-            self.logger.info(
+            self.logger.debug(
                 f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
             )
             return []
@@ -2565,7 +2565,7 @@ class MemorySqlManager:
             'time_filter_applied': False,
             'result_summary': summarize_memory_records(ordered),
         }
-        self.logger.info(
+        self.logger.debug(
             f"[时间过滤诊断][SimpleMemory检索结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return ordered
@@ -2986,7 +2986,7 @@ class MemorySqlManager:
             'time_range': str(time_range or ''),
             'memory_scope': str(memory_scope or ''),
         }
-        self.logger.info(
+        self.logger.debug(
             f"[时间过滤诊断][按时间硬过滤入参] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return await asyncio.to_thread(self._recall_by_time_sync, time_range, memory_scope)
@@ -3133,7 +3133,7 @@ class MemorySqlManager:
             'result_summary_by_created_at': summarize_memories_by_time_field(memories, field='created_at'),
             'time_field_usage': build_result_time_usage(memories, normalized_time_filter),
         }
-        self.logger.info(
+        self.logger.debug(
             f"[时间过滤诊断][按时间硬过滤结果] payload={json.dumps(payload, ensure_ascii=False)}"
         )
         return memories

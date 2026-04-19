@@ -588,7 +588,7 @@ class AngelMemoryPlugin(Star):
             "previous_selected_time_slot": previous_slot,
             "classification_scope": classification_scope,
         }
-        self.logger.info(
+        self.logger.debug(
             "[时间槽分类][触发判定] payload="
             f"{json.dumps(diagnostic_store['time_slot_trigger'], ensure_ascii=False)}"
         )
@@ -676,7 +676,7 @@ class AngelMemoryPlugin(Star):
                 "parsed_result": parsed_result.to_dict(),
                 "parse_success": bool(parsed_result.parse_success),
             }
-            self.logger.info(
+            self.logger.debug(
                 "[时间槽分类][模型原始输出] payload="
                 f"{json.dumps(diagnostic_store['time_slot_model_output'], ensure_ascii=False)}"
             )
@@ -758,7 +758,7 @@ class AngelMemoryPlugin(Star):
             "classification_status": classification_status,
             "error": str(decision_payload.get("error", "") or ""),
         }
-        self.logger.info(
+        self.logger.debug(
             "[时间槽分类][合法化结果] payload="
             f"{json.dumps(diagnostic_store['time_slot_legalization'], ensure_ascii=False)}"
         )
@@ -768,7 +768,7 @@ class AngelMemoryPlugin(Star):
         decision_payload["scope_name"] = scope_name
         decision_payload["session_id"] = session_id
         diagnostic_store["time_slot_classification"] = decision_payload
-        self.logger.info(
+        self.logger.debug(
             "[时间槽分类结果] payload="
             f"{json.dumps({'session_id': session_id, 'classification_status': classification_status, 'selected_time_slot': str(decision_payload.get('selected_time_slot', '') or ''), 'confidence': float(decision_payload.get('confidence', 0.0) or 0.0), 'abstain': bool(decision_payload.get('abstain')), 'normalized_time_range': str(final_time_intent.get('normalized_time_range', '') or ''), 'time_filter': final_time_filter}, ensure_ascii=False)}"
         )
@@ -801,7 +801,7 @@ class AngelMemoryPlugin(Star):
         }
         diagnostic_store["raw_chat_anchor"] = raw_chat_payload
         setattr(event, "_angel_memory_raw_chat_anchor_meta", raw_chat_payload)
-        self.logger.info(
+        self.logger.debug(
             "[时间过滤诊断][原始聊天锚点] payload="
             f"{json.dumps(raw_chat_payload, ensure_ascii=False)}"
         )
@@ -827,7 +827,7 @@ class AngelMemoryPlugin(Star):
         }
         diagnostic_store["raw_chat_recall"] = payload
         setattr(event, "_angel_memory_raw_chat_recall_meta", payload)
-        self.logger.info(
+        self.logger.debug(
             "[时间过滤诊断][原始聊天回顾] payload="
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
@@ -911,7 +911,7 @@ class AngelMemoryPlugin(Star):
             ),
         }
         diagnostic_store["no_memory_response_check"] = no_memory_payload
-        self.logger.info(
+        self.logger.debug(
             "[时间过滤诊断][无记忆答复核查] payload="
             f"{json.dumps(no_memory_payload, ensure_ascii=False)}"
         )
@@ -960,7 +960,7 @@ class AngelMemoryPlugin(Star):
             "recall_mode": recall_mode,
             "gate_note": "明确时间窗优先于 recall phrase，recall phrase 仅作增强信号。",
         }
-        self.logger.info(
+        self.logger.debug(
             "[时间过滤诊断][原始聊天门控] payload="
             f"{json.dumps(diagnostic_store['raw_chat_time_recall_gate'], ensure_ascii=False)}"
         )
@@ -1129,7 +1129,7 @@ class AngelMemoryPlugin(Star):
             "exact_raw_chat_only": exact_raw_chat_only,
             "gate_note": "最终合法时间槽一旦产出，即直接驱动 strict_time_recall 与 time_filter 透传。",
         }
-        self.logger.info(
+        self.logger.debug(
             "[时间过滤诊断][原始聊天门控] payload="
             f"{json.dumps(diagnostic_store['raw_chat_time_recall_gate'], ensure_ascii=False)}"
         )
@@ -1258,7 +1258,7 @@ class AngelMemoryPlugin(Star):
             "restrict_injection": bool(recall_policy.get("restrict_injection")),
             "prefer_raw_chat_only": bool(recall_policy.get("prefer_raw_chat_only")),
         }
-        self.logger.info(
+        self.logger.debug(
             "[时间槽分类][最终检索策略] payload="
             f"{json.dumps(diagnostic_store['time_slot_final_strategy'], ensure_ascii=False)}"
         )
@@ -1292,7 +1292,7 @@ class AngelMemoryPlugin(Star):
             f"{str(getattr(request, 'system_prompt', '') or '')}"
             f"{system_prompt_suffix}"
         )
-        self.logger.info(
+        self.logger.debug(
             f"[时间槽分类] 完成 session={session_id} anchor条数={len(rows)} "
             f"回顾条数={len(raw_chat_recall_rows)} 近期事实条数={len(recent_user_rows)}"
         )

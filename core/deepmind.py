@@ -20,6 +20,7 @@ from .utils.memory_id_resolver import MemoryIDResolver
 from .utils.time_diagnostics import (
     analyze_recall_request,
     analyze_time_intent,
+    build_time_intent_from_slot,
     build_time_filter_payload,
     compare_time_intent,
     get_event_diagnostic_store,
@@ -414,9 +415,9 @@ class DeepMind:
                 "recall_request": recall_request,
             }
         )
-        self.logger.info(
+        self.logger.debug(
             f"[时间过滤诊断][输入] session={session_id} payload="
-            f"{json.dumps({'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_intent, 'time_intent_rule_preview': rule_time_diagnostic.to_dict(), 'recall_request': recall_request, 'time_filter': time_filter}, ensure_ascii=False)}"
+            f"{ {'scope': memory_scope_preview or '', 'raw_user_input': preview_text(message_text, 160), 'time_intent': time_intent, 'time_intent_rule_preview': rule_time_diagnostic.to_dict(), 'recall_request': recall_request, 'time_filter': time_filter} }"
         )
 
         # 1. 从 event.angelheart_context 中获取对话历史（仅保留未处理消息）
@@ -511,28 +512,76 @@ class DeepMind:
             ),
         }
         diagnostic_store["query_build"] = query_build_payload
-        self.logger.info(
+        self.logger.debug(
             f"[时间过滤诊断][query构建] session={session_id} payload="
-            f"{json.dumps(query_build_payload, ensure_ascii=False)}"
+            f"{query_build_payload}"
         )
 
         if not self.provider_id:
             return
 
-        # 4. 检索长期记忆和笔记
-        retrieval_data = await self._retrieve_memories_and_notes(
-            event,
-            query,
-            precompute_vectors=True,
-            recall_policy=recall_policy,
-        )
+        # 4. 从大模型输出中读取决策指令。
+        should_recall = secretary_decision.get("should_recall_memory", True)
+        llm_time_slot_label = secretary_decision.get("target_time_slot", "")
 
-        long_term_memories = retrieval_data["long_term_memories"]
-        candidate_notes = retrieval_data["candidate_notes"]
-        core_topic = retrieval_data["core_topic"]
-        strict_time_recall = bool(recall_policy.get("strict_time_recall")) if isinstance(recall_policy, dict) else False
-        restrict_injection = bool(recall_policy.get("restrict_injection")) if isinstance(recall_policy, dict) else False
-        skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
+        if not should_recall:
+            self.logger.info(f"[{session_id}] 大模型决策：本轮无需检索长期记忆，直接跳过。")
+            time_filter = {}
+            diagnostic_store["time_filter"] = time_filter
+            long_term_memories = []
+            candidate_notes = []
+            core_topic = ""
+            strict_time_recall = False
+            restrict_injection = False
+            skip_notes = False
+        else:
+            if isinstance(llm_time_slot_label, str) and llm_time_slot_label.strip():
+                slot_name = llm_time_slot_label.strip()
+                intent_obj = build_time_intent_from_slot(slot_name, timezone_name="Asia/Shanghai")
+                time_filter = build_time_filter_payload(intent_obj)
+
+                if time_filter and time_filter.get("matched"):
+                    recall_policy["time_filter"] = time_filter
+                    recall_policy["strict_time_recall"] = True
+                    recall_policy["restrict_injection"] = True
+                    self.logger.info(
+                        f"[{session_id}] 大模型命中时间槽: {slot_name}, 解析范围: "
+                        f"{time_filter.get('start_ts')} - {time_filter.get('end_ts')}"
+                    )
+                else:
+                    recall_policy["time_filter"] = {}
+                    recall_policy["strict_time_recall"] = False
+                    recall_policy["restrict_injection"] = False
+                    recall_policy["skip_notes"] = False
+                    self.logger.warning(f"[{session_id}] 大模型下发的时间槽标签 '{slot_name}' 无法解析，降级为语义检索。")
+            else:
+                recall_policy["time_filter"] = {}
+                recall_policy["strict_time_recall"] = False
+                recall_policy["restrict_injection"] = False
+                recall_policy["skip_notes"] = False
+                self.logger.info(f"[{session_id}] 大模型未指定时间槽，执行语义检索。")
+
+            time_filter = dict(recall_policy.get("time_filter", {}) or {})
+            diagnostic_store["time_filter"] = time_filter
+
+            retrieval_data = await self._retrieve_memories_and_notes(
+                event,
+                query,
+                precompute_vectors=True,
+                recall_policy=recall_policy,
+            )
+
+            long_term_memories = retrieval_data["long_term_memories"]
+            candidate_notes = retrieval_data["candidate_notes"]
+            core_topic = retrieval_data["core_topic"]
+            strict_time_recall = bool(recall_policy.get("strict_time_recall")) if isinstance(recall_policy, dict) else False
+            restrict_injection = bool(recall_policy.get("restrict_injection")) if isinstance(recall_policy, dict) else False
+            skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
+
+        diagnostic_store["secretary_recall_decision"] = {
+            "should_recall_memory": bool(should_recall),
+            "target_time_slot": llm_time_slot_label if isinstance(llm_time_slot_label, str) else "",
+        }
 
         # 5. 将检索到的长期记忆填入短期记忆
         if long_term_memories and self.memory_system and not restrict_injection:
@@ -606,8 +655,14 @@ class DeepMind:
         }
         diagnostic_store["final_injection"] = injection_diagnostic
         self.logger.info(
+            f"[记忆注入] session={session_id} "
+            f"long_term={len(session_memories_for_injection)} "
+            f"notes={len(selected_notes)} "
+            f"restrict={restrict_injection}"
+        )
+        self.logger.debug(
             f"[时间过滤诊断][最终注入预览] session={session_id} payload="
-            f"{json.dumps(injection_diagnostic, ensure_ascii=False)}"
+            f"{injection_diagnostic}"
         )
 
         extra_instruction = ""
@@ -1272,6 +1327,7 @@ class DeepMind:
             reflection_input: 反思输入纯数据
         """
         try:
+            reflection_started_at = time.time()
             session_id = str(getattr(reflection_input, "session_id", "") or "").strip()
             if not session_id:
                 return False
@@ -1296,14 +1352,14 @@ class DeepMind:
 
             try:
                 dumped_records = json.dumps(raw_chat_records, ensure_ascii=False)
-                self.logger.info(f"【真实截获】用于推导时间的原始数据: {dumped_records}")
+                self.logger.debug(f"【真实截获】用于推导时间的原始数据: {dumped_records}")
             except Exception as e:
-                self.logger.error(
+                self.logger.debug(
                     f"【真实截获】JSON序列化失败: {e}, 原始数据: {raw_chat_records}"
                 )
 
             source_metadata = self._build_source_message_metadata(raw_chat_records)
-            self.logger.info(
+            self.logger.debug(
                 f"[反思落库][source] session={session_id} "
                 f"source_message_count={source_metadata.get('source_message_count', 0)} "
                 f"role_counts={source_metadata.get('role_counts', {})} "
@@ -1461,7 +1517,7 @@ class DeepMind:
                 if degraded_mode
                 else "normal_reflection"
             )
-            self.logger.info(
+            self.logger.debug(
                 f"[反思落库][content] session={session_id} "
                 f"generated_learning_content={generated_learning_content} "
                 f"memory_perspective={source_metadata.get('memory_perspective', '')} "
@@ -1526,20 +1582,17 @@ class DeepMind:
                     session_id, memories_for_session
                 )
                 session_updates_written = True
-            self.logger.info(
+            self.logger.debug(
                 f"[反思执行] 完成 session={session_id} "
                 f"useful={len(useful_ids)} new={len(newly_created_memories)}"
             )
             self.logger.info(
-                f"[反思落库][result] session={session_id} "
-                f"style_analysis_success=True "
-                f"generated_learning_content={bool(new_memories_normalized)} "
-                f"persona_applied={persona_applied} "
-                f"persona_review_written={persona_review_written} "
-                f"session_updates_written={session_updates_written} "
-                f"processed_messages={len(raw_chat_records) if isinstance(raw_chat_records, list) else 0} "
-                f"filtered_messages={len(newly_created_memories)} "
-                f"degraded_mode={degraded_mode} reason={degraded_reason}"
+                f"[反思落库] session={session_id} "
+                f"处理消息={len(raw_chat_records) if isinstance(raw_chat_records, list) else 0} "
+                f"提取记忆={len(newly_created_memories)} "
+                f"成功=True "
+                f"耗时={time.time() - reflection_started_at:.2f}s "
+                f"degraded={degraded_mode}"
             )
 
         except Exception as e:

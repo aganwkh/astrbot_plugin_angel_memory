@@ -99,10 +99,11 @@ class DeepMindRetrievalService:
             }
             retrieval_diagnostic["memory_call"] = memory_call_payload
             retrieval_diagnostic["memory_result"] = summarize_memory_records([])
-            deepmind.logger.info(
+            deepmind.logger.debug(
                 "[时间过滤诊断][长期记忆检索入参] payload="
-                f"{json.dumps(memory_call_payload, ensure_ascii=False)}"
+                f"{memory_call_payload}"
             )
+            deepmind.logger.info("[检索结果] 跳过长期记忆召回: 原始聊天回顾优先")
         elif deepmind.memory_system:
             try:
                 memory_scope = await deepmind.plugin_context.resolve_memory_scope_from_event(
@@ -137,9 +138,9 @@ class DeepMindRetrievalService:
                     "time_filter_note": "命中时间回顾问题时，将时间窗透传到底层检索函数。",
                 }
                 retrieval_diagnostic["memory_call"] = memory_call_payload
-                deepmind.logger.info(
+                deepmind.logger.debug(
                     "[时间过滤诊断][长期记忆检索入参] payload="
-                    f"{json.dumps(memory_call_payload, ensure_ascii=False)}"
+                    f"{memory_call_payload}"
                 )
 
                 long_term_memories = await deepmind.memory_system.chained_recall(
@@ -155,10 +156,11 @@ class DeepMindRetrievalService:
 
                 memory_result_payload = summarize_memory_records(long_term_memories)
                 retrieval_diagnostic["memory_result"] = memory_result_payload
-                deepmind.logger.info(
+                deepmind.logger.debug(
                     "[时间过滤诊断][长期记忆检索结果] payload="
-                    f"{json.dumps(memory_result_payload, ensure_ascii=False)}"
+                    f"{memory_result_payload}"
                 )
+                deepmind.logger.info(f"[检索结果] 召回长期记忆: {len(long_term_memories)} 条")
 
                 if deepmind.soul:
                     snapshots = [
@@ -221,10 +223,11 @@ class DeepMindRetrievalService:
                 "time_filter_applied": False,
                 "note": "note 检索链当前不支持 time_filter，且本轮已被跳过。",
             }
-            deepmind.logger.info(
+            deepmind.logger.debug(
                 "[时间过滤诊断][笔记检索入参] payload="
-                f"{json.dumps(note_call_payload, ensure_ascii=False)}"
+                f"{note_call_payload}"
             )
+            deepmind.logger.info("[检索结果] 跳过笔记召回: 时间窗回顾优先")
         elif deepmind.note_service:
             note_call_payload = {
                 "note_query": note_query,
@@ -242,9 +245,9 @@ class DeepMindRetrievalService:
                 "time_filter_note": "时间回顾问题默认跳过笔记；普通问题保持原有笔记检索。",
             }
             retrieval_diagnostic["note_call"] = note_call_payload
-            deepmind.logger.info(
+            deepmind.logger.debug(
                 "[时间过滤诊断][笔记检索入参] payload="
-                f"{json.dumps(note_call_payload, ensure_ascii=False)}"
+                f"{note_call_payload}"
             )
 
             candidate_notes = await deepmind.note_service.search_notes_by_top_k(
@@ -264,10 +267,11 @@ class DeepMindRetrievalService:
                 "note": "note 检索结果未应用 time_filter，请勿把它视为按时间窗过滤后的候选。",
             }
             retrieval_diagnostic["note_result"] = note_result_payload
-            deepmind.logger.info(
+            deepmind.logger.debug(
                 "[时间过滤诊断][笔记检索结果] payload="
-                f"{json.dumps(note_result_payload, ensure_ascii=False)}"
+                f"{note_result_payload}"
             )
+            deepmind.logger.info(f"[检索结果] 召回候选笔记: {len(candidate_notes)} 条")
 
         memory_id_mapping = {}
         if long_term_memories:
