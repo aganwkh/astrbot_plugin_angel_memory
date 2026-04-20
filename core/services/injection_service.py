@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional
+import datetime
 
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
@@ -65,6 +66,15 @@ class DeepMindInjectionService:
     ) -> None:
         deepmind = self.deepmind
         system_context_parts = []
+
+        now = datetime.datetime.now()
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        current_time_str = f"{now.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[now.weekday()]}"
+        system_context_parts.append(
+            "<current_time>\n"
+            f"当前系统时间: {current_time_str}\n"
+            "</current_time>"
+        )
 
         instruction = (
             "<instruction>\n"

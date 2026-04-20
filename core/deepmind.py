@@ -548,35 +548,51 @@ class DeepMind:
                         f"[{session_id}] 大模型命中时间槽: {slot_name}, 解析范围: "
                         f"{time_filter.get('start_ts')} - {time_filter.get('end_ts')}"
                     )
+
+                    # 只有在成功解析出时间窗时，才执行数据库检索。
+                    time_filter = dict(recall_policy.get("time_filter", {}) or {})
+                    diagnostic_store["time_filter"] = time_filter
+
+                    retrieval_data = await self._retrieve_memories_and_notes(
+                        event,
+                        query,
+                        precompute_vectors=True,
+                        recall_policy=recall_policy,
+                    )
+                    long_term_memories = retrieval_data["long_term_memories"]
+                    candidate_notes = retrieval_data["candidate_notes"]
+                    core_topic = retrieval_data["core_topic"]
+                    strict_time_recall = True
+                    restrict_injection = True
+                    skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
                 else:
                     recall_policy["time_filter"] = {}
                     recall_policy["strict_time_recall"] = False
                     recall_policy["restrict_injection"] = False
                     recall_policy["skip_notes"] = False
-                    self.logger.warning(f"[{session_id}] 大模型下发的时间槽标签 '{slot_name}' 无法解析，降级为语义检索。")
+                    self.logger.warning(f"[{session_id}] 大模型下发的时间槽标签 '{slot_name}' 无法解析，跳过检索。")
+                    time_filter = {}
+                    diagnostic_store["time_filter"] = time_filter
+                    long_term_memories = []
+                    candidate_notes = []
+                    core_topic = ""
+                    strict_time_recall = False
+                    restrict_injection = False
+                    skip_notes = False
             else:
                 recall_policy["time_filter"] = {}
                 recall_policy["strict_time_recall"] = False
                 recall_policy["restrict_injection"] = False
                 recall_policy["skip_notes"] = False
-                self.logger.info(f"[{session_id}] 大模型未指定时间槽，执行语义检索。")
-
-            time_filter = dict(recall_policy.get("time_filter", {}) or {})
-            diagnostic_store["time_filter"] = time_filter
-
-            retrieval_data = await self._retrieve_memories_and_notes(
-                event,
-                query,
-                precompute_vectors=True,
-                recall_policy=recall_policy,
-            )
-
-            long_term_memories = retrieval_data["long_term_memories"]
-            candidate_notes = retrieval_data["candidate_notes"]
-            core_topic = retrieval_data["core_topic"]
-            strict_time_recall = bool(recall_policy.get("strict_time_recall")) if isinstance(recall_policy, dict) else False
-            restrict_injection = bool(recall_policy.get("restrict_injection")) if isinstance(recall_policy, dict) else False
-            skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
+                self.logger.info(f"[{session_id}] 大模型未指定时间槽，跳过长期记忆检索。")
+                time_filter = {}
+                diagnostic_store["time_filter"] = time_filter
+                long_term_memories = []
+                candidate_notes = []
+                core_topic = ""
+                strict_time_recall = False
+                restrict_injection = False
+                skip_notes = False
 
         diagnostic_store["secretary_recall_decision"] = {
             "should_recall_memory": bool(should_recall),
