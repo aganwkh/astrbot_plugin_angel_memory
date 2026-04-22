@@ -523,8 +523,54 @@ class DeepMind:
         # 4. 从大模型输出中读取决策指令。
         should_recall = secretary_decision.get("should_recall_memory", True)
         llm_time_slot_label = secretary_decision.get("target_time_slot", "")
+        event_time_filter = (
+            dict(recall_policy.get("time_filter", {}) or {})
+            if isinstance(recall_policy, dict)
+            else {}
+        )
+        event_has_valid_time_window = bool(
+            event_time_filter.get("matched")
+            and event_time_filter.get("start_ts") is not None
+            and event_time_filter.get("end_ts") is not None
+        )
+        decision_source = "none"
 
-        if not should_recall:
+        if event_has_valid_time_window:
+            time_filter = event_time_filter
+            recall_policy["time_filter"] = time_filter
+            strict_time_recall = bool(
+                recall_policy.get("strict_time_recall", True)
+            )
+            restrict_injection = bool(
+                recall_policy.get("restrict_injection", strict_time_recall)
+            )
+            skip_notes = bool(recall_policy.get("skip_notes", strict_time_recall))
+            recall_policy["strict_time_recall"] = strict_time_recall
+            recall_policy["restrict_injection"] = restrict_injection
+            recall_policy["skip_notes"] = skip_notes
+            decision_source = "event_recall_policy"
+            slot_name = str(
+                time_filter.get("normalized_time_range")
+                or time_intent.get("normalized_time_range")
+                or time_filter.get("intent_type")
+                or ""
+            ).strip()
+            self.logger.info(
+                f"[{session_id}] 复用事件级时间槽策略: {slot_name or 'unknown'}, 解析范围: "
+                f"{time_filter.get('start_ts')} - {time_filter.get('end_ts')}"
+            )
+            diagnostic_store["time_filter"] = time_filter
+
+            retrieval_data = await self._retrieve_memories_and_notes(
+                event,
+                query,
+                precompute_vectors=True,
+                recall_policy=recall_policy,
+            )
+            long_term_memories = retrieval_data["long_term_memories"]
+            candidate_notes = retrieval_data["candidate_notes"]
+            core_topic = retrieval_data["core_topic"]
+        elif not should_recall:
             self.logger.info(f"[{session_id}] 大模型决策：本轮无需检索长期记忆，直接跳过。")
             time_filter = {}
             diagnostic_store["time_filter"] = time_filter
@@ -534,6 +580,7 @@ class DeepMind:
             strict_time_recall = False
             restrict_injection = False
             skip_notes = False
+            decision_source = "secretary_no_recall"
         else:
             if isinstance(llm_time_slot_label, str) and llm_time_slot_label.strip():
                 slot_name = llm_time_slot_label.strip()
@@ -565,6 +612,7 @@ class DeepMind:
                     strict_time_recall = True
                     restrict_injection = True
                     skip_notes = bool(recall_policy.get("skip_notes")) if isinstance(recall_policy, dict) else False
+                    decision_source = "secretary_time_slot"
                 else:
                     recall_policy["time_filter"] = {}
                     recall_policy["strict_time_recall"] = False
@@ -579,6 +627,7 @@ class DeepMind:
                     strict_time_recall = False
                     restrict_injection = False
                     skip_notes = False
+                    decision_source = "secretary_invalid_time_slot"
             else:
                 recall_policy["time_filter"] = {}
                 recall_policy["strict_time_recall"] = False
@@ -593,11 +642,19 @@ class DeepMind:
                 strict_time_recall = False
                 restrict_injection = False
                 skip_notes = False
+                decision_source = "secretary_no_time_slot"
 
+        diagnostic_store["decision_source"] = decision_source
         diagnostic_store["secretary_recall_decision"] = {
             "should_recall_memory": bool(should_recall),
             "target_time_slot": llm_time_slot_label if isinstance(llm_time_slot_label, str) else "",
+            "decision_source": decision_source,
+            "event_time_filter_matched": bool(event_has_valid_time_window),
         }
+        self.logger.debug(
+            f"[时间过滤诊断][长期记忆决策] session={session_id} payload="
+            f"{diagnostic_store['secretary_recall_decision']}"
+        )
 
         # 5. 将检索到的长期记忆填入短期记忆
         if long_term_memories and self.memory_system and not restrict_injection:
